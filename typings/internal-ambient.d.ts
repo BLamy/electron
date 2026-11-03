@@ -1,6 +1,6 @@
 /* eslint-disable no-var */
 declare var internalBinding: any;
-declare var binding: { get: (name: string) => any; process: NodeJS.Process; createPreloadScript: (src: string) => Function };
+declare var binding: { get: (name: string) => any; process: NodeJS.Process; createPreloadScript: (src: string, path: string) => Function };
 
 declare var isolatedApi: {
   guestViewInternal: any;

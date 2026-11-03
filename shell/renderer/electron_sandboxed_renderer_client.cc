@@ -80,9 +80,12 @@ v8::Local<v8::Value> GetBinding(v8::Isolate* isolate,
 }
 
 v8::Local<v8::Value> CreatePreloadScript(v8::Isolate* isolate,
-                                         v8::Local<v8::String> source) {
+                                         v8::Local<v8::String> source,
+                                         const std::string& path) {
   auto context = isolate->GetCurrentContext();
-  auto maybe_script = v8::Script::Compile(context, source);
+  // Named by its path, for stack traces and the debugger.
+  v8::ScriptOrigin origin(isolate, gin::StringToV8(isolate, "file://" + path));
+  auto maybe_script = v8::Script::Compile(context, source, &origin);
   v8::Local<v8::Script> script;
   if (!maybe_script.ToLocal(&script))
     return v8::Local<v8::Value>();

@@ -1,0 +1,24 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Brett Lamy <blamy@Bretts-MacBook-Pro.local>
+Date: Tue, 3 Nov 2026 04:53:56 -0500
+Subject: Start recording for pages which are files
+
+An Electron app's pages often are. They have no host, which is what a page
+that isn't ready yet looks like otherwise.
+
+diff --git a/third_party/blink/renderer/bindings/core/v8/local_window_proxy.cc b/third_party/blink/renderer/bindings/core/v8/local_window_proxy.cc
+index 6ffe488530677b828f8204a4c3c0232a7465e538..59e38d135db09ad1c2ddc43f5141f6c31ad67e2e 100644
+--- a/third_party/blink/renderer/bindings/core/v8/local_window_proxy.cc
++++ b/third_party/blink/renderer/bindings/core/v8/local_window_proxy.cc
+@@ -240,8 +240,10 @@ void LocalWindowProxy::Initialize() {
+     SetSecurityToken(origin.get());
+   }
+ 
++  // An Electron app's pages are often files, which have no host. That's what a page
++  // which isn't ready yet looks like otherwise.
+   if (recordreplay::IsRecordingOrReplaying("commands") &&
+-      origin && !origin->Host().empty()) {
++      origin && (!origin->Host().empty() || origin->Protocol() == "file")) {
+     bool initGlobally = !gRecordReplayStateInitialized;
+ 
+     // Whether this is the relative root frame of this process.

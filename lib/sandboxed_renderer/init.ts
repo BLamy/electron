@@ -116,13 +116,14 @@ require('@electron/internal/renderer/common-init');
 // - `process`: The `preloadProcess` object
 // - `Buffer`: Shim of `Buffer` implementation
 // - `global`: The window object, which is aliased to `global` by webpack.
-function runPreloadScript (preloadSrc: string) {
-  const preloadWrapperSrc = `(function(require, process, Buffer, global, setImmediate, clearImmediate, exports) {
-  ${preloadSrc}
+function runPreloadScript (preloadPath: string, preloadSrc: string) {
+  // The script starts on the wrapper's first line, so that a debugger's line numbers
+  // are the preload's own.
+  const preloadWrapperSrc = `(function(require, process, Buffer, global, setImmediate, clearImmediate, exports) {${preloadSrc}
   })`;
 
   // eval in window scope
-  const preloadFn = binding.createPreloadScript(preloadWrapperSrc);
+  const preloadFn = binding.createPreloadScript(preloadWrapperSrc, preloadPath);
   const { setImmediate, clearImmediate } = require('timers');
 
   preloadFn(preloadRequire, preloadProcess, Buffer, global, setImmediate, clearImmediate, {});
@@ -131,7 +132,7 @@ function runPreloadScript (preloadSrc: string) {
 for (const { preloadPath, preloadSrc, preloadError } of preloadScripts) {
   try {
     if (preloadSrc) {
-      runPreloadScript(preloadSrc);
+      runPreloadScript(preloadPath, preloadSrc);
     } else if (preloadError) {
       throw preloadError;
     }
