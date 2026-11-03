@@ -78,10 +78,27 @@ index b2575a7311401f8162ff3362a55c88e57c8fda5b..2cdcad4c61057112a347239d11eadd4e
  static bool AllowSideEffects();
  
 diff --git a/src/api/api.cc b/src/api/api.cc
-index 4cd7eea438d049aee7f4dae0dc945ddfe45f99cb..3fa9d785aecc2433f6cc5c510a266c3d2dc917e2 100644
+index 4cd7eea438d049aee7f4dae0dc945ddfe45f99cb..33975935def81277bb8638363ece89441134a67f 100644
 --- a/src/api/api.cc
 +++ b/src/api/api.cc
-@@ -2455,7 +2455,8 @@ MaybeLocal<Value> Module::Evaluate(Local<Context> context) {
+@@ -865,10 +865,16 @@ void MoveGlobalReference(internal::Address** from, internal::Address** to) {
+ void MakeWeak(i::Address* location, void* parameter,
+               WeakCallbackInfo<void>::Callback weak_callback,
+               WeakCallbackType type) {
++  // In a process which is the same on both sides, what the GC collects can't be what
++  // makes the embedder's code run, as the GC is hidden from the recording. So what
++  // would have been collected is kept: a browser process's objects leak, while recording
++  // and replaying.
++  if (recordreplay::IsSameOnBothSides()) return;
+   i::GlobalHandles::MakeWeak(location, parameter, weak_callback, type);
+ }
+ 
+ void MakeWeak(i::Address** location_addr) {
++  if (recordreplay::IsSameOnBothSides()) return;
+   i::GlobalHandles::MakeWeak(location_addr);
+ }
+ 
+@@ -2455,7 +2461,8 @@ MaybeLocal<Value> Module::Evaluate(Local<Context> context) {
                    "Expected instantiated module");
  
    // TODO: IsInReplayCode (RUN-1502)
@@ -91,7 +108,17 @@ index 4cd7eea438d049aee7f4dae0dc945ddfe45f99cb..3fa9d785aecc2433f6cc5c510a266c3d
  
    Local<Value> result;
    has_pending_exception =
-@@ -10795,6 +10796,8 @@ typedef char* (CommandCallbackRaw)(const char* params);
+@@ -2564,7 +2571,8 @@ int gReplaceSourceContentsScriptId;
+ 
+ MaybeHandle<String>
+ ReplayingReplaceScriptContents(Isolate* isolate, Handle<String> source) {
+-  if (!recordreplay::IsReplaying() || !IsMainThread()) {
++  if (!recordreplay::IsReplaying() || !IsMainThread() ||
++      recordreplay::IsSameOnBothSides()) {
+     return MaybeHandle<String>();
+   }
+ 
+@@ -10795,6 +10803,8 @@ typedef char* (CommandCallbackRaw)(const char* params);
    Macro(RecordReplayAreEventsPassedThrough, (), bool, false)                  \
    Macro(RecordReplayAreAssertsDisabled, (), bool, false)                      \
    Macro(RecordReplayCreateOrderedLock, (const char* name), size_t, 0)         \
@@ -100,7 +127,7 @@ index 4cd7eea438d049aee7f4dae0dc945ddfe45f99cb..3fa9d785aecc2433f6cc5c510a266c3d
    Macro(RecordReplayIsReplaying, (), bool, false)                             \
    Macro(RecordReplayHasDivergedFromRecording, (), bool, false)                \
    Macro(RecordReplayNewDependencyGraphNode, (const char* json), int, 0)       \
-@@ -10867,6 +10870,8 @@ typedef char* (CommandCallbackRaw)(const char* params);
+@@ -10867,6 +10877,8 @@ typedef char* (CommandCallbackRaw)(const char* params);
    Macro(RecordReplayAddMetadata, (const char* metadata))                      \
    Macro(RecordReplayJSONFree, (void*))                                        \
    Macro(RecordReplayOnAnnotation, (const char* kind, const char* contents))   \
@@ -109,7 +136,25 @@ index 4cd7eea438d049aee7f4dae0dc945ddfe45f99cb..3fa9d785aecc2433f6cc5c510a266c3d
    Macro(RecordReplayAddPossibleBreakpoint,                                    \
          (int line, int column, const char* function_id, int function_index))  \
    Macro(RecordReplayOnEvent, (const char* aEvent, bool aBefore))              \
-@@ -12231,6 +12236,14 @@ bool IsMainThread() {
+@@ -11354,7 +11366,7 @@ extern "C" DLLEXPORT void V8RecordReplayDiagnosticVA(const char* format, va_list
+ 
+ extern "C" DLLEXPORT void V8RecordReplayCommandDiagnosticVA(const char* format,
+                                                             va_list args) {
+-  if (recordreplay::IsReplaying()) {
++  if (recordreplay::IsReplaying() && !recordreplay::IsSameOnBothSides()) {
+     // TODO: RUN-2499
+     std::string finalFormat = "[CommandDiagnostic]" + std::string(format);
+     gRecordReplayPrint(finalFormat.c_str(), args);
+@@ -11372,7 +11384,7 @@ void recordreplay::CommandDiagnostic(const char* format, ...) {
+ 
+ extern "C" DLLEXPORT void V8RecordReplayCommandDiagnosticTraceVA(
+     const char* format, va_list args) {
+-  if (recordreplay::IsReplaying()) {
++  if (recordreplay::IsReplaying() && !recordreplay::IsSameOnBothSides()) {
+     // TODO: RUN-2499
+     std::string finalFormat = "[CommandDiagnostic]" + std::string(format);
+     gRecordReplayTrace(finalFormat.c_str(), args);
+@@ -12231,6 +12243,14 @@ bool IsMainThread() {
  }
  #endif
  
@@ -124,7 +169,7 @@ index 4cd7eea438d049aee7f4dae0dc945ddfe45f99cb..3fa9d785aecc2433f6cc5c510a266c3d
  // Set this process as recording or replaying.
  // Also serves to initializes Replay state.
  void recordreplay::SetRecordingOrReplaying(void* handle) {
-@@ -12249,6 +12262,7 @@ ForEachRecordReplaySymbolVoid(LoadRecordReplaySymbolVoid)
+@@ -12249,6 +12269,7 @@ ForEachRecordReplaySymbolVoid(LoadRecordReplaySymbolVoid)
  
    gRecordingOrReplaying = V8RecordReplayFeatureEnabled("record-replay", nullptr);
    InitMainThread();
@@ -132,7 +177,7 @@ index 4cd7eea438d049aee7f4dae0dc945ddfe45f99cb..3fa9d785aecc2433f6cc5c510a266c3d
  
    gAssertsDisabled = gRecordReplayAreAssertsDisabled();
  
-@@ -12292,7 +12306,7 @@ ForEachRecordReplaySymbolVoid(LoadRecordReplaySymbolVoid)
+@@ -12292,7 +12313,7 @@ ForEachRecordReplaySymbolVoid(LoadRecordReplaySymbolVoid)
  
    // Currently the dependency graph is enabled by default.
    i::gRecordReplayEnableDependencyGraph =
@@ -141,7 +186,7 @@ index 4cd7eea438d049aee7f4dae0dc945ddfe45f99cb..3fa9d785aecc2433f6cc5c510a266c3d
  
    i::gRecordReplayAssertDependencyGraph = !!getenv("RECORD_REPLAY_DEPENDENCY_GRAPH_ASSERTS");
  
-@@ -12313,7 +12327,8 @@ ForEachRecordReplaySymbolVoid(LoadRecordReplaySymbolVoid)
+@@ -12313,7 +12334,8 @@ ForEachRecordReplaySymbolVoid(LoadRecordReplaySymbolVoid)
    }
  
    // Disable some GC settings while replaying for causing mysterious crashes.
@@ -151,7 +196,7 @@ index 4cd7eea438d049aee7f4dae0dc945ddfe45f99cb..3fa9d785aecc2433f6cc5c510a266c3d
      i::FLAG_concurrent_marking = false;
      i::FLAG_concurrent_sweeping = false;
      i::FLAG_incremental_marking_task = false;
-@@ -12326,10 +12341,20 @@ ForEachRecordReplaySymbolVoid(LoadRecordReplaySymbolVoid)
+@@ -12326,10 +12348,25 @@ ForEachRecordReplaySymbolVoid(LoadRecordReplaySymbolVoid)
    }
  
    // For now the compilation cache is only used when recording.
@@ -168,12 +213,17 @@ index 4cd7eea438d049aee7f4dae0dc945ddfe45f99cb..3fa9d785aecc2433f6cc5c510a266c3d
 +    i::v8_flags.single_threaded = true;
 +    i::v8_flags.turbofan = false;
 +    i::v8_flags.sparkplug = false;
++    // Garbage collection is hidden from the recording, as it is in a renderer, because
++    // what the debugger does when replaying allocates. These keep it at the same points
++    // when it isn't doing anything, by not letting it depend on how long things took.
++    i::v8_flags.predictable_gc_schedule = true;
++    i::v8_flags.flush_bytecode = false;
 +  }
 +
    // Write out our pid to a file if specified.
    char* env = getenv("RECORD_REPLAY_PID_FILE");
    if (env) {
-@@ -12379,6 +12404,48 @@ extern "C" DLLEXPORT void V8RecordReplayExitReplayCode() {
+@@ -12379,6 +12416,47 @@ extern "C" DLLEXPORT void V8RecordReplayExitReplayCode() {
    gInReplayCode--;
  }
  
@@ -186,8 +236,7 @@ index 4cd7eea438d049aee7f4dae0dc945ddfe45f99cb..3fa9d785aecc2433f6cc5c510a266c3d
 +}
 +
 +bool recordreplay::ShouldDisallowNondeterministicEvents() {
-+  return !gSameOnBothSides || (IsMainThread() && gInReplayCode) ||
-+         HasDivergedFromRecording();
++  return true;
 +}
 +
 +void recordreplay::EnterReplayCode() {
@@ -298,7 +347,7 @@ index 84594ace6e6f66287dd012ceafd6eebeaa746929..c5a3faaf445fceb6048ff59573b666ca
    if (result_ != kSuccess) {
      tasm()->AbortedCodeGeneration();
 diff --git a/src/debug/debug.cc b/src/debug/debug.cc
-index 8781eb2efaec1f71c864b8b3d9291fd3500f7f91..f25a6a635e1b9564b789b4881a9002980d3e0aa2 100644
+index 8781eb2efaec1f71c864b8b3d9291fd3500f7f91..bf97f5d93a9e702d2ddb92a6a79ba0d503631b56 100644
 --- a/src/debug/debug.cc
 +++ b/src/debug/debug.cc
 @@ -9,6 +9,8 @@
@@ -321,7 +370,7 @@ index 8781eb2efaec1f71c864b8b3d9291fd3500f7f91..f25a6a635e1b9564b789b4881a900298
    Isolate* isolate = Isolate::Current();
    base::Optional<SaveAndSwitchContext> ssc;
    EnsureIsolateContext(isolate, ssc);
-@@ -3694,6 +3700,14 @@ bool RecordReplayIsInternalScriptURL(const char* url) {
+@@ -3694,6 +3700,15 @@ bool RecordReplayIsInternalScriptURL(const char* url) {
  
  extern bool RecordReplayHasDefaultContext();
  
@@ -330,13 +379,14 @@ index 8781eb2efaec1f71c864b8b3d9291fd3500f7f91..f25a6a635e1b9564b789b4881a900298
 +// sources, and aren't on the stack as far as the debugger's concerned.
 +bool RecordReplayIgnoreScriptByURL(const char* url) {
 +  return !strcmp(url, "v8/externalize") || !strcmp(url, "v8/gc") ||
-+         !strncmp(url, "node:", 5) || !strncmp(url, "electron/js2c/", 14);
++         !strncmp(url, "node:", 5) || !strncmp(url, "electron/js2c/", 14) ||
++         strstr(url, "/Contents/Resources/default_app.asar/");
 +}
 +
  typedef std::unordered_set<int> ScriptIdSet;
  static ScriptIdSet* gRegisteredScripts;
  
-@@ -3712,6 +3726,13 @@ bool RecordReplayIsDivergentUserJSWithoutPause(
+@@ -3712,6 +3727,13 @@ bool RecordReplayIsDivergentUserJSWithoutPause(
               Script::cast(shared.script()));
  }
  
@@ -350,7 +400,7 @@ index 8781eb2efaec1f71c864b8b3d9291fd3500f7f91..f25a6a635e1b9564b789b4881a900298
  typedef std::vector<std::pair<Eternal<Value>*, bool>> NewScriptHandlerVector;
  static NewScriptHandlerVector* gNewScriptHandlers;
  
-@@ -3769,6 +3790,15 @@ static void RecordReplayRegisterScript(Handle<Script> script) {
+@@ -3769,6 +3791,15 @@ static void RecordReplayRegisterScript(Handle<Script> script) {
      url = name.get();
    }
  
@@ -366,7 +416,7 @@ index 8781eb2efaec1f71c864b8b3d9291fd3500f7f91..f25a6a635e1b9564b789b4881a900298
    if (!strcmp(url.c_str(), "record-replay-internal")) {
      // [TT-1390] Hackfix to not register the sourcemap handling script.
      // We will have a better fix in the upcoming patch for TT-1112.
-@@ -4096,6 +4126,11 @@ void TrackObjectsCallback(bool track_objects) {
+@@ -4096,6 +4127,11 @@ void TrackObjectsCallback(bool track_objects) {
  
  // Whether to keep track of 'this' objects being assigned a property.
  bool RecordReplayTrackThisObjectAssignment(const std::string& property) {
@@ -378,7 +428,7 @@ index 8781eb2efaec1f71c864b8b3d9291fd3500f7f91..f25a6a635e1b9564b789b4881a900298
    // If we've been told to track objects then all 'this' objects which are
    // assigned a property will be tracked.
    if (gRecordReplayAssertTrackedObjects || gTrackObjects) {
-@@ -4397,4 +4432,165 @@ void FunctionCallbackRecordReplayGetScriptSource(const FunctionCallbackInfo<Valu
+@@ -4397,4 +4433,158 @@ void FunctionCallbackRecordReplayGetScriptSource(const FunctionCallbackInfo<Valu
    callArgs.GetReturnValue().Set(source_val);
  }
  
@@ -402,13 +452,6 @@ index 8781eb2efaec1f71c864b8b3d9291fd3500f7f91..f25a6a635e1b9564b789b4881a900298
 +void FunctionCallbackIsRecordingOrReplaying(const FunctionCallbackInfo<Value>& callArgs) {
 +  Local<Boolean> rv = Boolean::New(callArgs.GetIsolate(), recordreplay::IsRecordingOrReplaying());
 +  callArgs.GetReturnValue().Set(rv);
-+}
-+
-+void FunctionCallbackRecordReplayOnConsoleAPI(const FunctionCallbackInfo<Value>& callArgs) {
-+  CHECK(recordreplay::IsRecordingOrReplaying());
-+  if (IsMainThread()) {
-+    V8RecordReplayOnConsoleMessage(0);
-+  }
 +}
 +
 +void FunctionCallbackRecordReplayIgnoreScript(const FunctionCallbackInfo<Value>& callArgs) {
@@ -647,6 +690,20 @@ index fb22b4ed70825c723b98e19cc3cc50ab0c9d2979..6062b713e1153d7fa84961ebccf737a0
    NoGarbageCollectionMutexGuard lock_guard(g_mutex.Pointer());
  
    int waiters = 0;
+diff --git a/src/execution/isolate.cc b/src/execution/isolate.cc
+index 6cb8f2432d5e22e96816492203530e44b6280efd..03c8af930b2ef963a2680a8f95edc350bc79c6c7 100644
+--- a/src/execution/isolate.cc
++++ b/src/execution/isolate.cc
+@@ -1699,7 +1699,8 @@ void Isolate::RequestInterrupt(InterruptCallback callback, void* data) {
+ extern void RecordReplayTriggerProgressInterrupt();
+ 
+ void Isolate::InvokeApiInterruptCallbacks() {
+-  if (recordreplay::IsRecordingOrReplaying("interrupts")) {
++  if (recordreplay::IsRecordingOrReplaying("interrupts") &&
++      !recordreplay::IsSameOnBothSides()) {
+     // When recording, we can't invoke API interrupt callbacks at arbitrary points
+     // where we check for interrupts, as we won't be able to invoke those callbacks
+     // at the same point when replaying. Instead, after detecting that interrupts
 diff --git a/src/heap/allocation-observer.cc b/src/heap/allocation-observer.cc
 index e8e2d9daea5ded862d3ad6aca9e6ff2098971e84..e0a5d31b3629b1f87fe84a291ee4de8847f57215 100644
 --- a/src/heap/allocation-observer.cc
@@ -731,7 +788,7 @@ index 47ff54eba002e052c633c7c86e9601ec6d075964..42bc66d3de4e6eb07d6f23b441110f98
      if (!is_in_progress_) return false;
  
 diff --git a/src/heap/heap.cc b/src/heap/heap.cc
-index b479dcc203d0e186e18b8e3fdcf8ec52b99c5e41..3e5fdc7b032662b41964752c591f65b47dd07a32 100644
+index b479dcc203d0e186e18b8e3fdcf8ec52b99c5e41..bef5fbfa1f07745f8981837cb8c1773e341e34c7 100644
 --- a/src/heap/heap.cc
 +++ b/src/heap/heap.cc
 @@ -1466,7 +1466,7 @@ void ReportDuplicates(int size, std::vector<HeapObject>* objects) {
@@ -788,7 +845,16 @@ index b479dcc203d0e186e18b8e3fdcf8ec52b99c5e41..3e5fdc7b032662b41964752c591f65b4
  
    if (!sweeping_in_progress()) return;
  
-@@ -3723,7 +3723,7 @@ void Heap::ActivateMemoryReducerIfNeeded() {
+@@ -3619,6 +3619,8 @@ double ComputeMutatorUtilizationImpl(double mutator_speed, double gc_speed) {
+ 
+ double Heap::ComputeMutatorUtilization(const char* tag, double mutator_speed,
+                                        double gc_speed) {
++  // These speeds are measured, so they aren't the same on both sides.
++  if (recordreplay::IsSameOnBothSides()) return 0.0;
+   double result = ComputeMutatorUtilizationImpl(mutator_speed, gc_speed);
+   if (v8_flags.trace_mutator_utilization) {
+     isolate()->PrintWithTimestamp(
+@@ -3723,7 +3725,7 @@ void Heap::ActivateMemoryReducerIfNeeded() {
    const int kMinCommittedMemory = 7 * Page::kPageSize;
    if (ms_count_ == 0 && CommittedMemory() > kMinCommittedMemory &&
        isolate()->IsIsolateInBackground()) {
@@ -797,7 +863,16 @@ index b479dcc203d0e186e18b8e3fdcf8ec52b99c5e41..3e5fdc7b032662b41964752c591f65b4
      MemoryReducer::Event event;
      event.type = MemoryReducer::kPossibleGarbage;
      event.time_ms = MonotonicallyIncreasingTimeInMs();
-@@ -3999,7 +3999,7 @@ void Heap::CheckMemoryPressure() {
+@@ -3734,7 +3736,7 @@ void Heap::ActivateMemoryReducerIfNeeded() {
+ bool Heap::ShouldReduceNewSpaceSize() const {
+   static const size_t kLowAllocationThroughput = 1000;
+ 
+-  if (v8_flags.predictable) return false;
++  if (v8_flags.predictable || recordreplay::IsSameOnBothSides()) return false;
+ 
+   const double allocation_throughput =
+       tracer_->CurrentAllocationThroughputInBytesPerMillisecond();
+@@ -3999,7 +4001,7 @@ void Heap::CheckMemoryPressure() {
  }
  
  void Heap::CollectGarbageOnMemoryPressure() {
@@ -806,7 +881,7 @@ index b479dcc203d0e186e18b8e3fdcf8ec52b99c5e41..3e5fdc7b032662b41964752c591f65b4
  
    const int kGarbageThresholdInBytes = 8 * MB;
    const double kGarbageThresholdAsFractionOfTotalMemory = 0.1;
-@@ -4038,7 +4038,7 @@ void Heap::CollectGarbageOnMemoryPressure() {
+@@ -4038,7 +4040,7 @@ void Heap::CollectGarbageOnMemoryPressure() {
  
  void Heap::MemoryPressureNotification(MemoryPressureLevel level,
                                        bool is_isolate_locked) {
@@ -815,7 +890,7 @@ index b479dcc203d0e186e18b8e3fdcf8ec52b99c5e41..3e5fdc7b032662b41964752c591f65b4
  
    TRACE_EVENT1("devtools.timeline,v8", "V8.MemoryPressureNotification", "level",
                 static_cast<int>(level));
-@@ -5082,7 +5082,7 @@ bool Heap::ShouldOptimizeForLoadTime() {
+@@ -5082,7 +5084,7 @@ bool Heap::ShouldOptimizeForLoadTime() {
  // - either we need to optimize for memory usage,
  // - or the incremental marking is not in progress and we cannot start it.
  bool Heap::ShouldExpandOldGenerationOnSlowAllocation(LocalHeap* local_heap) {
@@ -824,7 +899,7 @@ index b479dcc203d0e186e18b8e3fdcf8ec52b99c5e41..3e5fdc7b032662b41964752c591f65b4
  
    // Always allow background threads to allocate while replaying without triggering GC.
    // Waiting on a main thread GC can introduce deadlocks if the main thread
-@@ -5679,7 +5679,7 @@ void Heap::NotifyBootstrapComplete() {
+@@ -5679,7 +5681,7 @@ void Heap::NotifyBootstrapComplete() {
  
  void Heap::NotifyOldGenerationExpansion(AllocationSpace space,
                                          MemoryChunk* chunk) {
@@ -833,7 +908,7 @@ index b479dcc203d0e186e18b8e3fdcf8ec52b99c5e41..3e5fdc7b032662b41964752c591f65b4
  
    // Pages created during bootstrapping may contain immortal immovable objects.
    if (!deserialization_complete()) {
-@@ -5773,7 +5773,7 @@ void Heap::RegisterExternallyReferencedObject(Address* location) {
+@@ -5773,7 +5775,7 @@ void Heap::RegisterExternallyReferencedObject(Address* location) {
  }
  
  void Heap::StartTearDown() {
@@ -842,7 +917,7 @@ index b479dcc203d0e186e18b8e3fdcf8ec52b99c5e41..3e5fdc7b032662b41964752c591f65b4
  
    // Finish any ongoing sweeping to avoid stray background tasks still accessing
    // the heap during teardown.
-@@ -7323,7 +7323,7 @@ void Heap::FinishSweepingIfOutOfWork() {
+@@ -7323,7 +7325,7 @@ void Heap::FinishSweepingIfOutOfWork() {
  }
  
  void Heap::EnsureSweepingCompleted(SweepingForcedFinalizationMode mode) {
@@ -969,16 +1044,37 @@ index 3f0d2d324a3dfe1c78bf11bd6ee3abcfa38f00b4..954231f869a7a99f7c2593a5238b00ff
  }
  
  BytecodeArrayBuilder& BytecodeArrayBuilder::RecordReplayInstrumentation(
-diff --git a/src/replay/replay-runtime-weak-refs.cc b/src/replay/replay-runtime-weak-refs.cc
-index d0779280c4dbf75fec3cc9ef838a1443ad96c092..a537b1267f2116d9bf7fa132b13ed1844b6566e0 100644
---- a/src/replay/replay-runtime-weak-refs.cc
-+++ b/src/replay/replay-runtime-weak-refs.cc
-@@ -14,7 +14,7 @@ RUNTIME_FUNCTION(Runtime_JSReplayWeakRefConstruct) {
-   DCHECK_EQ(1, args.length());
-   Handle<HeapObject> object = args.at<HeapObject>(0);
+diff --git a/src/parsing/pending-compilation-error-handler.cc b/src/parsing/pending-compilation-error-handler.cc
+index 1e7cc0403819df1d5bf160fc650f6780ca24d5e6..1bfe81c71022bcc90fbed28f240712603b147886 100644
+--- a/src/parsing/pending-compilation-error-handler.cc
++++ b/src/parsing/pending-compilation-error-handler.cc
+@@ -180,7 +180,7 @@ void PendingCompilationErrorHandler::ThrowPendingError(
+   Handle<String> arg1 = error_details_.ArgString(isolate, 1);
+   isolate->debug()->OnCompileError(script);
  
 -  if (recordreplay::IsReplaying()) {
 +  if (recordreplay::IsReplaying() && !recordreplay::IsSameOnBothSides()) {
+     std::string url;
+     if (!script->name().IsUndefined()) {
+       std::unique_ptr<char[]> name = String::cast(script->name()).ToCString();
+diff --git a/src/replay/replay-runtime-weak-refs.cc b/src/replay/replay-runtime-weak-refs.cc
+index d0779280c4dbf75fec3cc9ef838a1443ad96c092..1fc49d53a334de4cf151308aedaffef5f0194d19 100644
+--- a/src/replay/replay-runtime-weak-refs.cc
++++ b/src/replay/replay-runtime-weak-refs.cc
+@@ -1,4 +1,5 @@
+ #include "include/replayio.h"
++#include "src/base/replayio.h"
+ #include "src/execution/arguments-inl.h"
+ #include "src/objects/js-weak-refs-inl.h"
+ #include "src/replay/weak-refs.h"
+@@ -15,6 +16,10 @@ RUNTIME_FUNCTION(Runtime_JSReplayWeakRefConstruct) {
+   Handle<HeapObject> object = args.at<HeapObject>(0);
+ 
+   if (recordreplay::IsReplaying()) {
++    // Only when replaying: what this allocates can't come from a heap which has to be the
++    // same on both sides.
++    replayio::AutoMaybeDisallowEvents disallow(recordreplay::IsSameOnBothSides(),
++                                               "JSReplayWeakRefConstruct");
      replayio::ReplayWeakRefPins::Pin(isolate, *object);
    }
  

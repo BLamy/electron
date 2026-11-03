@@ -36,10 +36,10 @@ index 13fd1469ef0aa33853ddc6f31eda5b15f6312138..00d430e8e22de046fbb08b4b754ccd5d
      "src/node_constants.cc",
      "src/node_contextify.cc",
 diff --git a/lib/internal/bootstrap/node.js b/lib/internal/bootstrap/node.js
-index 026b47299ff3633a57c57af1512a0921fdafb0c4..54c30e80bbc9b54d6989d664c8df876c31f31d98 100644
+index 026b47299ff3633a57c57af1512a0921fdafb0c4..48af5aafb312eb6337b24c49fce48981aa728eca 100644
 --- a/lib/internal/bootstrap/node.js
 +++ b/lib/internal/bootstrap/node.js
-@@ -172,6 +172,50 @@ const rawMethods = internalBinding('process_methods');
+@@ -172,6 +172,49 @@ const rawMethods = internalBinding('process_methods');
    process.reallyExit = rawMethods.reallyExit;
    process._kill = rawMethods._kill;
  
@@ -58,7 +58,6 @@ index 026b47299ff3633a57c57af1512a0921fdafb0c4..54c30e80bbc9b54d6989d664c8df876c
 +      return `https://app.replay.io/recording/${recordingId}?point=${point}&hasFrames=true&time=${time}`;
 +    },
 +
-+    _onConsoleAPI: rawMethods.recordReplayOnConsoleAPI,
 +    _ignoreScript: rawMethods.recordReplayIgnoreScript,
 +    _setCommandCallback: rawMethods.recordReplaySetCommandCallback,
 +    _setClearPauseDataCallback: rawMethods.recordReplaySetClearPauseDataCallback,
@@ -109,7 +108,7 @@ index 8993197ebd9eb54ec918767e16d665caebbf3554..532693b9923a188f5342e9bb39ea5ca0
  
  function refreshRuntimeOptions() {
 diff --git a/lib/internal/console/constructor.js b/lib/internal/console/constructor.js
-index d8434f2311a3751425167f02e25a5739888f12b4..2686972a57754d412fc4776f1623de90662c7d83 100644
+index d8434f2311a3751425167f02e25a5739888f12b4..e094750ebdf0c10caa45c817314123fe41532f7b 100644
 --- a/lib/internal/console/constructor.js
 +++ b/lib/internal/console/constructor.js
 @@ -39,6 +39,9 @@ const {
@@ -133,36 +132,7 @@ index d8434f2311a3751425167f02e25a5739888f12b4..2686972a57754d412fc4776f1623de90
        const ignoreErrors = this._ignoreErrors;
        const groupIndent = this[kGroupIndent];
  
-@@ -371,13 +378,28 @@ function createWriteErrorHandler(instance, streamSymbol) {
-   };
- }
- 
-+// Note: the "this" value for this call is the console message arguments,
-+// which Target_getCurrentMessageContents will read via the inspector.
-+function onConsoleMessage() {
-+  if (process.recordreplay) {
-+    process.recordreplay._onConsoleAPI();
-+  }
-+}
-+
- const consoleMethods = {
-   log(...args) {
-+    onConsoleMessage.call(args);
-     this[kWriteToConsole](kUseStdout, this[kFormatForStdout](args));
-   },
- 
- 
-   warn(...args) {
-+    onConsoleMessage.call(args);
-+    this[kWriteToConsole](kUseStderr, this[kFormatForStderr](args));
-+  },
-+
-+  error(...args) {
-+    onConsoleMessage.call(args);
-     this[kWriteToConsole](kUseStderr, this[kFormatForStderr](args));
-   },
- 
-@@ -437,6 +459,7 @@ const consoleMethods = {
+@@ -437,6 +444,7 @@ const consoleMethods = {
  
    // Defined by: https://console.spec.whatwg.org/#clear
    clear() {
@@ -170,20 +140,12 @@ index d8434f2311a3751425167f02e25a5739888f12b4..2686972a57754d412fc4776f1623de90
      // It only makes sense to clear if _stdout is a TTY.
      // Otherwise, do nothing.
      if (this._stdout.isTTY && process.env.TERM !== 'dumb') {
-@@ -681,7 +704,6 @@ for (const method of ReflectOwnKeys(consoleMethods))
- Console.prototype.debug = Console.prototype.log;
- Console.prototype.info = Console.prototype.log;
- Console.prototype.dirxml = Console.prototype.log;
--Console.prototype.error = Console.prototype.warn;
- Console.prototype.groupCollapsed = Console.prototype.group;
- 
- function initializeGlobalConsole(globalConsole) {
 diff --git a/lib/internal/recordreplay/main.js b/lib/internal/recordreplay/main.js
 new file mode 100644
-index 0000000000000000000000000000000000000000..d8b56b156dd33ece0f4ad356b3ec4092ad232673
+index 0000000000000000000000000000000000000000..cabaf9fcde656f428dd41f3f763142bf8d3c7a53
 --- /dev/null
 +++ b/lib/internal/recordreplay/main.js
-@@ -0,0 +1,292 @@
+@@ -0,0 +1,266 @@
 +'use strict';
 +
 +// Methods for interacting with the record/replay driver.
@@ -300,35 +262,9 @@ index 0000000000000000000000000000000000000000..d8b56b156dd33ece0f4ad356b3ec4092
 +    };
 +  }
 +
-+  // Look for the "args" variable on an onConsoleMessage frame.
-+  // The arguments are also stored on the last console API call, though
-+  // if we use that we need to be careful because the pause state could have
-+  // been cleared since the last Runtime.consoleAPICalled event.
-+  const { callFrames } = sendMessage("Debugger.getCallFrames");
-+  const consoleMessageFrame = callFrames.find(
-+    frame => frame.functionName == "onConsoleMessage"
-+  );
-+  assert(consoleMessageFrame);
-+  assert(consoleMessageFrame.this.type == "object");
-+  assert(consoleMessageFrame.this.className == "Array");
-+  const argumentsId = consoleMessageFrame.this.objectId;
-+
-+  // Get the properties of the message arguments array.
-+  const argumentsProperties = sendMessage("Runtime.getProperties", {
-+    objectId: argumentsId,
-+    ownProperties: true,
-+    generatePreview: false,
-+  }).result;
-+
-+  // Get the protocol representation of the message arguments.
-+  const argumentValues = [];
-+  for (let i = 0;; i++) {
-+    const property = argumentsProperties.find(prop => prop.name == i.toString());
-+    if (!property) {
-+      break;
-+    }
-+    argumentValues.push(remoteObjectToProtocolValue(property.value));
-+  }
++  // V8 reports a console call after telling the inspector about it.
++  assert(gLastConsoleAPICall);
++  const argumentValues = (gLastConsoleAPICall.args || []).map(remoteObjectToProtocolValue);
 +
 +  const level = cdpToRrpConsoleLevels.get(gLastConsoleAPICall.type) || "info";
 +
@@ -1440,10 +1376,10 @@ index bc5d41382f20f1f90894b59df68b6ae08096315c..fb35319bdcd3f59b23161dade084fb95
  }  // namespace process
 diff --git a/src/node_recordreplay.cc b/src/node_recordreplay.cc
 new file mode 100644
-index 0000000000000000000000000000000000000000..fdda4a8468b3cb19869376acff2557fca6c349c8
+index 0000000000000000000000000000000000000000..c67c55dbdb7e35374169b8170ec1db04877decc4
 --- /dev/null
 +++ b/src/node_recordreplay.cc
-@@ -0,0 +1,250 @@
+@@ -0,0 +1,246 @@
 +// Replay's debugger, for the Node in an Electron browser process: the process
 +// binding's record/replay methods. From src/node_recordreplay.cc in Replay's Node.
 +//
@@ -1474,7 +1410,6 @@ index 0000000000000000000000000000000000000000..fdda4a8468b3cb19869376acff2557fc
 +namespace v8 {
 +
 +extern void FunctionCallbackIsRecordingOrReplaying(const FunctionCallbackInfo<Value>& args);
-+extern void FunctionCallbackRecordReplayOnConsoleAPI(const FunctionCallbackInfo<Value>& args);
 +extern void FunctionCallbackRecordReplaySetCommandCallback(const FunctionCallbackInfo<Value>& args);
 +extern void FunctionCallbackRecordReplaySetClearPauseDataCallback(const FunctionCallbackInfo<Value>& callArgs);
 +extern void FunctionCallbackRecordReplayIgnoreScript(const FunctionCallbackInfo<Value>& args);
@@ -1647,8 +1582,6 @@ index 0000000000000000000000000000000000000000..fdda4a8468b3cb19869376acff2557fc
 +  env->SetMethod(target,
 +                 "recordReplayAreEventsUnavailable",
 +                 RecordReplayAreEventsUnavailable);
-+  env->SetMethod(target, "recordReplayOnConsoleAPI",
-+                 v8::FunctionCallbackRecordReplayOnConsoleAPI);
 +  env->SetMethod(target, "recordReplaySetCommandCallback",
 +                 v8::FunctionCallbackRecordReplaySetCommandCallback);
 +  env->SetMethod(target, "recordReplaySetClearPauseDataCallback",
@@ -1678,7 +1611,6 @@ index 0000000000000000000000000000000000000000..fdda4a8468b3cb19869376acff2557fc
 +  registry->Register(v8::FunctionCallbackIsRecordingOrReplaying);
 +  registry->Register(RecordReplayLog);
 +  registry->Register(RecordReplayAreEventsUnavailable);
-+  registry->Register(v8::FunctionCallbackRecordReplayOnConsoleAPI);
 +  registry->Register(v8::FunctionCallbackRecordReplaySetCommandCallback);
 +  registry->Register(v8::FunctionCallbackRecordReplaySetClearPauseDataCallback);
 +  registry->Register(v8::FunctionCallbackRecordReplayIgnoreScript);

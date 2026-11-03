@@ -13,6 +13,7 @@
 #include "base/trace_event/trace_event.h"
 #include "gin/data_object_builder.h"
 #include "mojo/public/cpp/system/platform_handle.h"
+#include "shell/common/replay_ipc_log.h"
 #include "shell/common/electron_constants.h"
 #include "shell/common/gin_converters/blink_converter.h"
 #include "shell/common/gin_converters/value_converter.h"
@@ -160,6 +161,9 @@ void ElectronApiServiceImpl::Message(bool internal,
   blink::WebLocalFrame* frame = render_frame()->GetWebFrame();
   if (!frame)
     return;
+
+  if (!internal)
+    replay::LogIpc("message", channel);
 
   v8::Isolate* isolate = blink::MainThreadIsolate();
   v8::HandleScope handle_scope(isolate);

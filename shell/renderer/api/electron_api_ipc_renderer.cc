@@ -20,6 +20,7 @@
 #include "shell/common/gin_helper/promise.h"
 #include "shell/common/node_bindings.h"
 #include "shell/common/node_includes.h"
+#include "shell/common/replay_ipc_log.h"
 #include "shell/common/v8_value_serializer.h"
 #include "third_party/blink/public/common/associated_interfaces/associated_interface_provider.h"
 #include "third_party/blink/public/web/web_local_frame.h"
@@ -99,6 +100,8 @@ class IPCRenderer : public gin::Wrappable<IPCRenderer>,
     if (!electron::SerializeV8Value(isolate, arguments, &message)) {
       return;
     }
+    if (!internal)
+      electron::replay::LogIpc("send", channel);
     electron_ipc_remote_->Message(internal, channel, std::move(message));
   }
 
@@ -118,12 +121,17 @@ class IPCRenderer : public gin::Wrappable<IPCRenderer>,
     gin_helper::Promise<blink::CloneableMessage> p(isolate);
     auto handle = p.GetHandle();
 
-    electron_ipc_remote_->Invoke(
-        internal, channel, std::move(message),
-        base::BindOnce(
-            [](gin_helper::Promise<blink::CloneableMessage> p,
-               blink::CloneableMessage result) { p.Resolve(result); },
-            std::move(p)));
+    electron::mojom::ElectronApiIPC::InvokeCallback callback = base::BindOnce(
+        [](gin_helper::Promise<blink::CloneableMessage> p,
+           blink::CloneableMessage result) { p.Resolve(result); },
+        std::move(p));
+    if (!internal) {
+      callback = electron::replay::LogIpcCall("invoke", channel, 0,
+                                              std::move(callback));
+    }
+
+    electron_ipc_remote_->Invoke(internal, channel, std::move(message),
+                                 std::move(callback));
 
     return handle;
   }
@@ -215,9 +223,12 @@ class IPCRenderer : public gin::Wrappable<IPCRenderer>,
       return v8::Local<v8::Value>();
     }
 
+    int id = internal ? 0 : electron::replay::LogIpc("sendSync", channel);
     blink::CloneableMessage result;
     electron_ipc_remote_->MessageSync(internal, channel, std::move(message),
                                       &result);
+    if (id)
+      electron::replay::LogIpc("reply", channel, 0, id);
     return electron::DeserializeV8Value(isolate, result);
   }
 

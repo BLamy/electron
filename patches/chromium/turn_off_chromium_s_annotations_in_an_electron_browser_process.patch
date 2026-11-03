@@ -303,3 +303,19 @@ index 9e346bcbbcce4c240ae0c9bfff8c3ac8f78b1d8d..ff2045a909f0a13d8ca91383855422e8
    V8RecordReplayEndDependencyExecution();
  }
  
+diff --git a/third_party/blink/renderer/bindings/core/v8/local_window_proxy.cc b/third_party/blink/renderer/bindings/core/v8/local_window_proxy.cc
+index 6ffe488530677b828f8204a4c3c0232a7465e538..59e38d135db09ad1c2ddc43f5141f6c31ad67e2e 100644
+--- a/third_party/blink/renderer/bindings/core/v8/local_window_proxy.cc
++++ b/third_party/blink/renderer/bindings/core/v8/local_window_proxy.cc
+@@ -240,8 +240,10 @@ void LocalWindowProxy::Initialize() {
+     SetSecurityToken(origin.get());
+   }
+ 
++  // An Electron app's pages are often files, which have no host. That's what a page
++  // which isn't ready yet looks like otherwise.
+   if (recordreplay::IsRecordingOrReplaying("commands") &&
+-      origin && !origin->Host().empty()) {
++      origin && (!origin->Host().empty() || origin->Protocol() == "file")) {
+     bool initGlobally = !gRecordReplayStateInitialized;
+ 
+     // Whether this is the relative root frame of this process.

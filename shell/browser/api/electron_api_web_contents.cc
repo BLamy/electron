@@ -105,6 +105,7 @@
 #include "shell/common/api/electron_bindings.h"
 #include "shell/common/color_util.h"
 #include "shell/common/electron_constants.h"
+#include "shell/common/replay_ipc_log.h"
 #include "shell/common/gin_converters/base_converter.h"
 #include "shell/common/gin_converters/blink_converter.h"
 #include "shell/common/gin_converters/callback_converter.h"
@@ -1779,16 +1780,29 @@ bool WebContents::EmitNavigationEvent(
               frame_routing_id);
 }
 
+namespace {
+
+// The renderer a message came from, for matching the two sides up when recording.
+int SenderProcessId(content::RenderFrameHost* sender) {
+  return sender ? sender->GetProcess()->GetProcess().Pid() : 0;
+}
+
+}  // namespace
+
 void WebContents::Message(bool internal,
                           const std::string& channel,
                           blink::CloneableMessage arguments,
                           content::RenderFrameHost* render_frame_host) {
   TRACE_EVENT1("electron", "WebContents::Message", "channel", channel);
+  int peer = SenderProcessId(render_frame_host);
+  int id = internal ? 0 : replay::LogIpc("send", channel, peer);
   // webContents.emit('-ipc-message', new Event(), internal, channel,
   // arguments);
   EmitWithSender("-ipc-message", render_frame_host,
                  electron::mojom::ElectronApiIPC::InvokeCallback(), internal,
                  channel, std::move(arguments));
+  if (id)
+    replay::LogIpc("handled", channel, peer, id);
 }
 
 void WebContents::Invoke(
@@ -1798,6 +1812,11 @@ void WebContents::Invoke(
     electron::mojom::ElectronApiIPC::InvokeCallback callback,
     content::RenderFrameHost* render_frame_host) {
   TRACE_EVENT1("electron", "WebContents::Invoke", "channel", channel);
+  if (!internal) {
+    callback = replay::LogIpcCall("invoke", channel,
+                                  SenderProcessId(render_frame_host),
+                                  std::move(callback));
+  }
   // webContents.emit('-ipc-invoke', new Event(), internal, channel, arguments);
   EmitWithSender("-ipc-invoke", render_frame_host, std::move(callback),
                  internal, channel, std::move(arguments));
@@ -1832,6 +1851,11 @@ void WebContents::MessageSync(
     electron::mojom::ElectronApiIPC::MessageSyncCallback callback,
     content::RenderFrameHost* render_frame_host) {
   TRACE_EVENT1("electron", "WebContents::MessageSync", "channel", channel);
+  if (!internal) {
+    callback = replay::LogIpcCall("sendSync", channel,
+                                  SenderProcessId(render_frame_host),
+                                  std::move(callback));
+  }
   // webContents.emit('-ipc-message-sync', new Event(sender, message), internal,
   // channel, arguments);
   EmitWithSender("-ipc-message-sync", render_frame_host, std::move(callback),
