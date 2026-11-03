@@ -95,11 +95,34 @@ static void* OpenDriver(void) {
   return dlopen(path, RTLD_LAZY);
 }
 
+// Blink reads its scripts for the debugger from the app, and only knows where they
+// are in Replay Chromium's layout. This goes in the recording's environment.
+static void SetAssetsDirectory(void) {
+  if (getenv("RECORD_REPLAY_ASSETS_DIRECTORY")) {
+    return;
+  }
+  Dl_info info;
+  if (!dladdr((void*)SetAssetsDirectory, &info) || !info.dli_fname) {
+    return;
+  }
+  char path[2048];
+  snprintf(path, sizeof(path), "%s", info.dli_fname);
+  char* contents = strstr(path, "/Contents/Frameworks/");
+  if (!contents) {
+    return;
+  }
+  snprintf(contents, sizeof(path) - (contents - path), "/replay-assets");
+  setenv("RECORD_REPLAY_ASSETS_DIRECTORY", path, 1);
+}
+
 __attribute__((constructor)) static void ReplayAttach(void) {
   int replaying = !*_NSGetArgc();
   const char* type = replaying ? "main" : ProcessType();
-  if (!replaying && !ShouldRecord(type)) {
-    return;
+  if (!replaying) {
+    if (!ShouldRecord(type)) {
+      return;
+    }
+    SetAssetsDirectory();
   }
 
   void* handle = OpenDriver();

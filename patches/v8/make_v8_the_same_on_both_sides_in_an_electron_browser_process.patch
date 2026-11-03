@@ -78,10 +78,20 @@ index b2575a7311401f8162ff3362a55c88e57c8fda5b..2cdcad4c61057112a347239d11eadd4e
  static bool AllowSideEffects();
  
 diff --git a/src/api/api.cc b/src/api/api.cc
-index 4cd7eea438d049aee7f4dae0dc945ddfe45f99cb..a9ccc095b986adbd1def89f9e5d7ed26ae3f2c0e 100644
+index 4cd7eea438d049aee7f4dae0dc945ddfe45f99cb..3fa9d785aecc2433f6cc5c510a266c3d2dc917e2 100644
 --- a/src/api/api.cc
 +++ b/src/api/api.cc
-@@ -10795,6 +10795,8 @@ typedef char* (CommandCallbackRaw)(const char* params);
+@@ -2455,7 +2455,8 @@ MaybeLocal<Value> Module::Evaluate(Local<Context> context) {
+                   "Expected instantiated module");
+ 
+   // TODO: IsInReplayCode (RUN-1502)
+-  v8::recordreplay::AssertMaybeEventsDisallowed("JS Module::Evaluate %d", ScriptId());
++  v8::recordreplay::AssertMaybeEventsDisallowed(
++      "JS Module::Evaluate %d", self->IsSourceTextModule() ? ScriptId() : -1);
+ 
+   Local<Value> result;
+   has_pending_exception =
+@@ -10795,6 +10796,8 @@ typedef char* (CommandCallbackRaw)(const char* params);
    Macro(RecordReplayAreEventsPassedThrough, (), bool, false)                  \
    Macro(RecordReplayAreAssertsDisabled, (), bool, false)                      \
    Macro(RecordReplayCreateOrderedLock, (const char* name), size_t, 0)         \
@@ -90,7 +100,7 @@ index 4cd7eea438d049aee7f4dae0dc945ddfe45f99cb..a9ccc095b986adbd1def89f9e5d7ed26
    Macro(RecordReplayIsReplaying, (), bool, false)                             \
    Macro(RecordReplayHasDivergedFromRecording, (), bool, false)                \
    Macro(RecordReplayNewDependencyGraphNode, (const char* json), int, 0)       \
-@@ -10867,6 +10869,8 @@ typedef char* (CommandCallbackRaw)(const char* params);
+@@ -10867,6 +10870,8 @@ typedef char* (CommandCallbackRaw)(const char* params);
    Macro(RecordReplayAddMetadata, (const char* metadata))                      \
    Macro(RecordReplayJSONFree, (void*))                                        \
    Macro(RecordReplayOnAnnotation, (const char* kind, const char* contents))   \
@@ -99,7 +109,7 @@ index 4cd7eea438d049aee7f4dae0dc945ddfe45f99cb..a9ccc095b986adbd1def89f9e5d7ed26
    Macro(RecordReplayAddPossibleBreakpoint,                                    \
          (int line, int column, const char* function_id, int function_index))  \
    Macro(RecordReplayOnEvent, (const char* aEvent, bool aBefore))              \
-@@ -12231,6 +12235,14 @@ bool IsMainThread() {
+@@ -12231,6 +12236,14 @@ bool IsMainThread() {
  }
  #endif
  
@@ -114,7 +124,7 @@ index 4cd7eea438d049aee7f4dae0dc945ddfe45f99cb..a9ccc095b986adbd1def89f9e5d7ed26
  // Set this process as recording or replaying.
  // Also serves to initializes Replay state.
  void recordreplay::SetRecordingOrReplaying(void* handle) {
-@@ -12249,6 +12261,7 @@ ForEachRecordReplaySymbolVoid(LoadRecordReplaySymbolVoid)
+@@ -12249,6 +12262,7 @@ ForEachRecordReplaySymbolVoid(LoadRecordReplaySymbolVoid)
  
    gRecordingOrReplaying = V8RecordReplayFeatureEnabled("record-replay", nullptr);
    InitMainThread();
@@ -122,7 +132,7 @@ index 4cd7eea438d049aee7f4dae0dc945ddfe45f99cb..a9ccc095b986adbd1def89f9e5d7ed26
  
    gAssertsDisabled = gRecordReplayAreAssertsDisabled();
  
-@@ -12292,7 +12305,7 @@ ForEachRecordReplaySymbolVoid(LoadRecordReplaySymbolVoid)
+@@ -12292,7 +12306,7 @@ ForEachRecordReplaySymbolVoid(LoadRecordReplaySymbolVoid)
  
    // Currently the dependency graph is enabled by default.
    i::gRecordReplayEnableDependencyGraph =
@@ -131,7 +141,7 @@ index 4cd7eea438d049aee7f4dae0dc945ddfe45f99cb..a9ccc095b986adbd1def89f9e5d7ed26
  
    i::gRecordReplayAssertDependencyGraph = !!getenv("RECORD_REPLAY_DEPENDENCY_GRAPH_ASSERTS");
  
-@@ -12313,7 +12326,8 @@ ForEachRecordReplaySymbolVoid(LoadRecordReplaySymbolVoid)
+@@ -12313,7 +12327,8 @@ ForEachRecordReplaySymbolVoid(LoadRecordReplaySymbolVoid)
    }
  
    // Disable some GC settings while replaying for causing mysterious crashes.
@@ -141,7 +151,7 @@ index 4cd7eea438d049aee7f4dae0dc945ddfe45f99cb..a9ccc095b986adbd1def89f9e5d7ed26
      i::FLAG_concurrent_marking = false;
      i::FLAG_concurrent_sweeping = false;
      i::FLAG_incremental_marking_task = false;
-@@ -12326,10 +12340,20 @@ ForEachRecordReplaySymbolVoid(LoadRecordReplaySymbolVoid)
+@@ -12326,10 +12341,20 @@ ForEachRecordReplaySymbolVoid(LoadRecordReplaySymbolVoid)
    }
  
    // For now the compilation cache is only used when recording.
@@ -163,7 +173,7 @@ index 4cd7eea438d049aee7f4dae0dc945ddfe45f99cb..a9ccc095b986adbd1def89f9e5d7ed26
    // Write out our pid to a file if specified.
    char* env = getenv("RECORD_REPLAY_PID_FILE");
    if (env) {
-@@ -12379,6 +12403,48 @@ extern "C" DLLEXPORT void V8RecordReplayExitReplayCode() {
+@@ -12379,6 +12404,48 @@ extern "C" DLLEXPORT void V8RecordReplayExitReplayCode() {
    gInReplayCode--;
  }
  
@@ -288,18 +298,30 @@ index 84594ace6e6f66287dd012ceafd6eebeaa746929..c5a3faaf445fceb6048ff59573b666ca
    if (result_ != kSuccess) {
      tasm()->AbortedCodeGeneration();
 diff --git a/src/debug/debug.cc b/src/debug/debug.cc
-index 8781eb2efaec1f71c864b8b3d9291fd3500f7f91..ce92d1ac0fa2a9c9372e51f35551e18a1e2cdb1a 100644
+index 8781eb2efaec1f71c864b8b3d9291fd3500f7f91..f25a6a635e1b9564b789b4881a9002980d3e0aa2 100644
 --- a/src/debug/debug.cc
 +++ b/src/debug/debug.cc
-@@ -9,6 +9,7 @@
+@@ -9,6 +9,8 @@
  
  #include "src/api/api-inl.h"
  #include "src/base/platform/mutex.h"
++#include "src/base/replayio.h"
 +#include "src/tasks/task-utils.h"
  #include "src/builtins/builtins.h"
  #include "src/codegen/compilation-cache.h"
  #include "src/codegen/compiler.h"
-@@ -3694,6 +3695,14 @@ bool RecordReplayIsInternalScriptURL(const char* url) {
+@@ -3421,6 +3423,10 @@ extern void RecordReplayAddPossibleBreakpoint(int line, int column, const char*
+ static void EnsureIsolateContext(Isolate* isolate, base::Optional<SaveAndSwitchContext>& ssc);
+ 
+ void RecordReplayGetPossibleBreakpointsCallback(const char* script_id_str) {
++  // Only runs when replaying. If the target's heap has to be the same on both sides, what this
++  // allocates can't come from it.
++  replayio::AutoMaybeDisallowEvents disallow(recordreplay::IsSameOnBothSides(),
++                                             "GetPossibleBreakpoints");
+   Isolate* isolate = Isolate::Current();
+   base::Optional<SaveAndSwitchContext> ssc;
+   EnsureIsolateContext(isolate, ssc);
+@@ -3694,6 +3700,14 @@ bool RecordReplayIsInternalScriptURL(const char* url) {
  
  extern bool RecordReplayHasDefaultContext();
  
@@ -314,7 +336,7 @@ index 8781eb2efaec1f71c864b8b3d9291fd3500f7f91..ce92d1ac0fa2a9c9372e51f35551e18a
  typedef std::unordered_set<int> ScriptIdSet;
  static ScriptIdSet* gRegisteredScripts;
  
-@@ -3712,6 +3721,13 @@ bool RecordReplayIsDivergentUserJSWithoutPause(
+@@ -3712,6 +3726,13 @@ bool RecordReplayIsDivergentUserJSWithoutPause(
               Script::cast(shared.script()));
  }
  
@@ -328,7 +350,7 @@ index 8781eb2efaec1f71c864b8b3d9291fd3500f7f91..ce92d1ac0fa2a9c9372e51f35551e18a
  typedef std::vector<std::pair<Eternal<Value>*, bool>> NewScriptHandlerVector;
  static NewScriptHandlerVector* gNewScriptHandlers;
  
-@@ -3769,6 +3785,15 @@ static void RecordReplayRegisterScript(Handle<Script> script) {
+@@ -3769,6 +3790,15 @@ static void RecordReplayRegisterScript(Handle<Script> script) {
      url = name.get();
    }
  
@@ -344,7 +366,19 @@ index 8781eb2efaec1f71c864b8b3d9291fd3500f7f91..ce92d1ac0fa2a9c9372e51f35551e18a
    if (!strcmp(url.c_str(), "record-replay-internal")) {
      // [TT-1390] Hackfix to not register the sourcemap handling script.
      // We will have a better fix in the upcoming patch for TT-1112.
-@@ -4397,4 +4422,165 @@ void FunctionCallbackRecordReplayGetScriptSource(const FunctionCallbackInfo<Valu
+@@ -4096,6 +4126,11 @@ void TrackObjectsCallback(bool track_objects) {
+ 
+ // Whether to keep track of 'this' objects being assigned a property.
+ bool RecordReplayTrackThisObjectAssignment(const std::string& property) {
++  // This changes the bytecode, which has to be the same on both sides here.
++  if (recordreplay::IsSameOnBothSides()) {
++    return false;
++  }
++
+   // If we've been told to track objects then all 'this' objects which are
+   // assigned a property will be tracked.
+   if (gRecordReplayAssertTrackedObjects || gTrackObjects) {
+@@ -4397,4 +4432,165 @@ void FunctionCallbackRecordReplayGetScriptSource(const FunctionCallbackInfo<Valu
    callArgs.GetReturnValue().Set(source_val);
  }
  
@@ -948,6 +982,45 @@ index d0779280c4dbf75fec3cc9ef838a1443ad96c092..a537b1267f2116d9bf7fa132b13ed184
      replayio::ReplayWeakRefPins::Pin(isolate, *object);
    }
  
+diff --git a/src/runtime/runtime-debug.cc b/src/runtime/runtime-debug.cc
+index 8d1a87a33339551423d221bb2169d3797e8757ee..91327fd25490a5ad17cdd59546c9ece1c56b9410 100644
+--- a/src/runtime/runtime-debug.cc
++++ b/src/runtime/runtime-debug.cc
+@@ -1469,18 +1469,26 @@ static inline void OnInstrumentation(Isolate* isolate,
+                                      Handle<JSFunction> function, int32_t index) {
+   CHECK(RecordReplayBytecodeAllowed());
+ 
+-  Handle<Script> script(Script::cast(function->shared().script()), isolate);
+-  CHECK(RecordReplayHasRegisteredScript(*script));
++  InstrumentationSite* site;
++  {
++    // Instrumentation only runs when replaying. If the target's heap has to be the same on
++    // both sides, what this allocates can't come from it.
++    replayio::AutoMaybeDisallowEvents disallow(recordreplay::IsSameOnBothSides(),
++                                               "OnInstrumentation");
+ 
+-  InstrumentationSite& site = GetInstrumentationSite("Callback", index);
++    Handle<Script> script(Script::cast(function->shared().script()), isolate);
++    CHECK(RecordReplayHasRegisteredScript(*script));
+ 
+-  if (!site.function_id_.length()) {
+-    Handle<SharedFunctionInfo> shared(function->shared(), isolate);
+-    site.function_id_ = GetRecordReplayFunctionId(shared);
++    site = &GetInstrumentationSite("Callback", index);
++
++    if (!site->function_id_.length()) {
++      Handle<SharedFunctionInfo> shared(function->shared(), isolate);
++      site->function_id_ = GetRecordReplayFunctionId(shared);
++    }
+   }
+ 
+-  RecordReplayInstrument(site.kind_, site.function_id_.c_str(),
+-                         site.function_index_);
++  RecordReplayInstrument(site->kind_, site->function_id_.c_str(),
++                         site->function_index_);
+ }
+ 
+ extern bool gRecordReplayInstrumentationEnabled;
 diff --git a/src/wasm/module-compiler.cc b/src/wasm/module-compiler.cc
 index 285f36550ecd6676789c2ed2678e61c1c9b48850..94ff968493eab57ebb124865d7c881b412fb9ce2 100644
 --- a/src/wasm/module-compiler.cc

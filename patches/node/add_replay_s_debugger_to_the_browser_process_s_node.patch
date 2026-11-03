@@ -1440,10 +1440,10 @@ index bc5d41382f20f1f90894b59df68b6ae08096315c..fb35319bdcd3f59b23161dade084fb95
  }  // namespace process
 diff --git a/src/node_recordreplay.cc b/src/node_recordreplay.cc
 new file mode 100644
-index 0000000000000000000000000000000000000000..9fc85ce8d389ff044c9ddd9ecc23c7c7d318bda8
+index 0000000000000000000000000000000000000000..fdda4a8468b3cb19869376acff2557fca6c349c8
 --- /dev/null
 +++ b/src/node_recordreplay.cc
-@@ -0,0 +1,251 @@
+@@ -0,0 +1,250 @@
 +// Replay's debugger, for the Node in an Electron browser process: the process
 +// binding's record/replay methods. From src/node_recordreplay.cc in Replay's Node.
 +//
@@ -1640,15 +1640,13 @@ index 0000000000000000000000000000000000000000..9fc85ce8d389ff044c9ddd9ecc23c7c7
 +  V8RecordReplayOnAnnotation(*kind, *contents);
 +}
 +
-+}  // namespace process
-+
 +void InitializeRecordReplayMethods(Environment* env, Local<Object> target) {
 +  env->SetMethod(target, "isRecordingOrReplaying",
 +                 v8::FunctionCallbackIsRecordingOrReplaying);
-+  env->SetMethod(target, "recordReplayLog", process::RecordReplayLog);
++  env->SetMethod(target, "recordReplayLog", RecordReplayLog);
 +  env->SetMethod(target,
 +                 "recordReplayAreEventsUnavailable",
-+                 process::RecordReplayAreEventsUnavailable);
++                 RecordReplayAreEventsUnavailable);
 +  env->SetMethod(target, "recordReplayOnConsoleAPI",
 +                 v8::FunctionCallbackRecordReplayOnConsoleAPI);
 +  env->SetMethod(target, "recordReplaySetCommandCallback",
@@ -1662,9 +1660,9 @@ index 0000000000000000000000000000000000000000..9fc85ce8d389ff044c9ddd9ecc23c7c7
 +  env->SetMethod(target, "recordReplayGetCurrentError",
 +                 v8::FunctionCallbackRecordReplayGetCurrentError);
 +  env->SetMethod(target, "recordReplaySetCDPMessageCallback",
-+                 process::RecordReplaySetCDPMessageCallback);
++                 RecordReplaySetCDPMessageCallback);
 +  env->SetMethod(target, "recordReplaySendCDPMessage",
-+                 process::RecordReplaySendCDPMessage);
++                 RecordReplaySendCDPMessage);
 +  env->SetMethod(target, "recordReplayRecordingId",
 +                 v8::FunctionCallbackRecordReplayGetRecordingId);
 +  env->SetMethod(target, "recordReplayCurrentExecutionPoint",
@@ -1672,26 +1670,27 @@ index 0000000000000000000000000000000000000000..9fc85ce8d389ff044c9ddd9ecc23c7c7
 +  env->SetMethod(target, "recordReplayElapsedTimeMs",
 +                 v8::FunctionCallbackRecordReplayElapsedTimeMs);
 +  env->SetMethod(
-+      target, "recordReplayAnnotationHook", process::RecordReplayAnnotationHook);
++      target, "recordReplayAnnotationHook", RecordReplayAnnotationHook);
 +}
 +
 +void RegisterRecordReplayExternalReferences(
 +    ExternalReferenceRegistry* registry) {
 +  registry->Register(v8::FunctionCallbackIsRecordingOrReplaying);
-+  registry->Register(process::RecordReplayLog);
-+  registry->Register(process::RecordReplayAreEventsUnavailable);
++  registry->Register(RecordReplayLog);
++  registry->Register(RecordReplayAreEventsUnavailable);
 +  registry->Register(v8::FunctionCallbackRecordReplayOnConsoleAPI);
 +  registry->Register(v8::FunctionCallbackRecordReplaySetCommandCallback);
 +  registry->Register(v8::FunctionCallbackRecordReplaySetClearPauseDataCallback);
 +  registry->Register(v8::FunctionCallbackRecordReplayIgnoreScript);
 +  registry->Register(v8::FunctionCallbackRecordReplayAssert);
 +  registry->Register(v8::FunctionCallbackRecordReplayGetCurrentError);
-+  registry->Register(process::RecordReplaySetCDPMessageCallback);
-+  registry->Register(process::RecordReplaySendCDPMessage);
++  registry->Register(RecordReplaySetCDPMessageCallback);
++  registry->Register(RecordReplaySendCDPMessage);
 +  registry->Register(v8::FunctionCallbackRecordReplayGetRecordingId);
 +  registry->Register(v8::FunctionCallbackRecordReplayCurrentExecutionPoint);
 +  registry->Register(v8::FunctionCallbackRecordReplayElapsedTimeMs);
-+  registry->Register(process::RecordReplayAnnotationHook);
++  registry->Register(RecordReplayAnnotationHook);
 +}
 +
++}  // namespace process
 +}  // namespace node
