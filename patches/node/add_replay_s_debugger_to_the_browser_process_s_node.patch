@@ -1,0 +1,1697 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Brett Lamy <blamy@Bretts-MacBook-Pro.local>
+Date: Tue, 3 Nov 2026 02:51:04 -0500
+Subject: Add Replay's debugger to the browser process's Node
+
+The process binding's record/replay methods, process.recordreplay, and the
+JS which handles the debugger's commands, from Replay's Node. That fork also
+annotates Node's threads and its GC callbacks so that they're the same when
+replaying, and loads the driver at startup. An Electron browser process needs
+none of that: it attaches before anything runs, its recorded threads run one
+at a time, and V8 does the same things on both sides.
+
+diff --git a/filenames.json b/filenames.json
+index 13fd1469ef0aa33853ddc6f31eda5b15f6312138..00d430e8e22de046fbb08b4b754ccd5d2257ddf5 100644
+--- a/filenames.json
++++ b/filenames.json
+@@ -271,6 +271,12 @@
+     "lib/internal/webstreams/transfer.js",
+     "lib/internal/bootstrap/loaders.js",
+     "lib/internal/bootstrap/pre_execution.js",
++    "lib/internal/recordreplay/main.js",
++    "lib/internal/recordreplay/message.js",
++    "lib/internal/recordreplay/object.js",
++    "lib/internal/recordreplay/preview.js",
++    "lib/internal/recordreplay/sourcemap.js",
++    "lib/internal/recordreplay/utils.js",
+     "lib/internal/bootstrap/node.js",
+     "lib/internal/bootstrap/environment.js",
+     "lib/internal/bootstrap/switches/does_not_own_process_state.js",
+@@ -451,6 +457,7 @@
+     "src/node_binding.cc",
+     "src/node_blob.cc",
+     "src/node_buffer.cc",
++    "src/node_recordreplay.cc",
+     "src/node_config.cc",
+     "src/node_constants.cc",
+     "src/node_contextify.cc",
+diff --git a/lib/internal/bootstrap/node.js b/lib/internal/bootstrap/node.js
+index 026b47299ff3633a57c57af1512a0921fdafb0c4..54c30e80bbc9b54d6989d664c8df876c31f31d98 100644
+--- a/lib/internal/bootstrap/node.js
++++ b/lib/internal/bootstrap/node.js
+@@ -172,6 +172,50 @@ const rawMethods = internalBinding('process_methods');
+   process.reallyExit = rawMethods.reallyExit;
+   process._kill = rawMethods._kill;
+ 
++  const recordreplay = {
++    log: rawMethods.recordReplayLog,
++    assert: rawMethods.recordReplayAssert,
++    recordingId: rawMethods.recordReplayRecordingId,
++    currentPoint: rawMethods.recordReplayCurrentExecutionPoint,
++    elapsedTime: rawMethods.recordReplayElapsedTimeMs,
++    annotationHook: rawMethods.recordReplayAnnotationHook,
++
++    currentPointURL() {
++      const recordingId = rawMethods.recordReplayRecordingId();
++      const point = rawMethods.recordReplayCurrentExecutionPoint();
++      const time = rawMethods.recordReplayElapsedTimeMs();
++      return `https://app.replay.io/recording/${recordingId}?point=${point}&hasFrames=true&time=${time}`;
++    },
++
++    _onConsoleAPI: rawMethods.recordReplayOnConsoleAPI,
++    _ignoreScript: rawMethods.recordReplayIgnoreScript,
++    _setCommandCallback: rawMethods.recordReplaySetCommandCallback,
++    _setClearPauseDataCallback: rawMethods.recordReplaySetClearPauseDataCallback,
++    _setCDPMessageCallback: rawMethods.recordReplaySetCDPMessageCallback,
++    _sendCDPMessage: rawMethods.recordReplaySendCDPMessage,
++    _getCurrentError: rawMethods.recordReplayGetCurrentError,
++  };
++
++  ObjectDefineProperty(process, "recordreplay", {
++    get() {
++      if (rawMethods.isRecordingOrReplaying()) {
++        return recordreplay;
++      }
++    },
++    // If the user tries to set this to another value, override
++    // this completely to that value.
++    set(value) {
++      ObjectDefineProperty(this, "recordreplay", {
++        value,
++        configurable: true,
++        enumerable: true,
++        writable: true
++      });
++    },
++    enumerable: true,
++    configurable: true
++  });
++
+   const wrapped = perThreadSetup.wrapProcessMethods(rawMethods);
+   process._rawDebug = wrapped._rawDebug;
+   process.cpuUsage = wrapped.cpuUsage;
+diff --git a/lib/internal/bootstrap/pre_execution.js b/lib/internal/bootstrap/pre_execution.js
+index 8993197ebd9eb54ec918767e16d665caebbf3554..532693b9923a188f5342e9bb39ea5ca0529f2fc0 100644
+--- a/lib/internal/bootstrap/pre_execution.js
++++ b/lib/internal/bootstrap/pre_execution.js
+@@ -95,6 +95,13 @@ function prepareMainThreadExecution(expandArgv1 = false,
+   loadPreloadModules();
+   initializeFrozenIntrinsics();
+   setupAsarSupport();
++
++  // Replay's debugger, on the browser process's main context. In a renderer
++  // Blink handles its commands.
++  if (process.recordreplay && process.type === 'browser') {
++    const { initializeRecordReplay } = require('internal/recordreplay/main');
++    initializeRecordReplay();
++  }
+ }
+ 
+ function refreshRuntimeOptions() {
+diff --git a/lib/internal/console/constructor.js b/lib/internal/console/constructor.js
+index d8434f2311a3751425167f02e25a5739888f12b4..2686972a57754d412fc4776f1623de90662c7d83 100644
+--- a/lib/internal/console/constructor.js
++++ b/lib/internal/console/constructor.js
+@@ -39,6 +39,9 @@ const {
+ } = primordials;
+ 
+ const { trace } = internalBinding('trace_events');
++const {
++  recordReplayAreEventsUnavailable,
++} = internalBinding('process_methods');
+ const {
+   isStackOverflowError,
+   codes: {
+@@ -269,6 +272,10 @@ ObjectDefineProperties(Console.prototype, {
+     __proto__: null,
+     ...consolePropAttributes,
+     value: function(streamSymbol, string) {
++      // Output from any Console is dropped in an evaluation in a pause, where
++      // the stream or fs writes it would reach throw or diverge.
++      if (recordReplayAreEventsUnavailable()) return;
++
+       const ignoreErrors = this._ignoreErrors;
+       const groupIndent = this[kGroupIndent];
+ 
+@@ -371,13 +378,28 @@ function createWriteErrorHandler(instance, streamSymbol) {
+   };
+ }
+ 
++// Note: the "this" value for this call is the console message arguments,
++// which Target_getCurrentMessageContents will read via the inspector.
++function onConsoleMessage() {
++  if (process.recordreplay) {
++    process.recordreplay._onConsoleAPI();
++  }
++}
++
+ const consoleMethods = {
+   log(...args) {
++    onConsoleMessage.call(args);
+     this[kWriteToConsole](kUseStdout, this[kFormatForStdout](args));
+   },
+ 
+ 
+   warn(...args) {
++    onConsoleMessage.call(args);
++    this[kWriteToConsole](kUseStderr, this[kFormatForStderr](args));
++  },
++
++  error(...args) {
++    onConsoleMessage.call(args);
+     this[kWriteToConsole](kUseStderr, this[kFormatForStderr](args));
+   },
+ 
+@@ -437,6 +459,7 @@ const consoleMethods = {
+ 
+   // Defined by: https://console.spec.whatwg.org/#clear
+   clear() {
++    if (recordReplayAreEventsUnavailable()) return;
+     // It only makes sense to clear if _stdout is a TTY.
+     // Otherwise, do nothing.
+     if (this._stdout.isTTY && process.env.TERM !== 'dumb') {
+@@ -681,7 +704,6 @@ for (const method of ReflectOwnKeys(consoleMethods))
+ Console.prototype.debug = Console.prototype.log;
+ Console.prototype.info = Console.prototype.log;
+ Console.prototype.dirxml = Console.prototype.log;
+-Console.prototype.error = Console.prototype.warn;
+ Console.prototype.groupCollapsed = Console.prototype.group;
+ 
+ function initializeGlobalConsole(globalConsole) {
+diff --git a/lib/internal/recordreplay/main.js b/lib/internal/recordreplay/main.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..d8b56b156dd33ece0f4ad356b3ec4092ad232673
+--- /dev/null
++++ b/lib/internal/recordreplay/main.js
+@@ -0,0 +1,292 @@
++'use strict';
++
++// Methods for interacting with the record/replay driver.
++
++const {
++  initMessages,
++  sendMessage,
++  addEventListener,
++} = require("internal/recordreplay/message");
++const {
++  remoteObjectToProtocolValue,
++  clearPauseDataCallback,
++  protocolIdToRemoteObject,
++} = require("internal/recordreplay/object");
++const {
++  createProtocolObject,
++  createProtocolFrame,
++  createProtocolLocation,
++  createProtocolScope,
++} = require("internal/recordreplay/preview");
++const {
++  registerSourceMap,
++  processSourceMaps,
++  getSourceMapURL
++} = require("internal/recordreplay/sourcemap");
++const { assert, log } = require("internal/recordreplay/utils");
++
++function initializeRecordReplay() {
++  if (process.recordreplay) {
++    initMessages();
++    process.recordreplay._setCommandCallback(commandCallback);
++    process.recordreplay._setClearPauseDataCallback(clearPauseDataCallback);
++    addEventListener("Runtime.consoleAPICalled", onConsoleAPICall);
++    addEventListener("Debugger.scriptParsed", registerSourceMap);
++    process.on("exit", processSourceMaps);
++    sendMessage("Runtime.enable");
++    sendMessage("Debugger.enable");
++  }
++}
++
++const CommandCallbacks = {
++  "Target.countStackFrames": Target_countStackFrames,
++  "Target.evaluatePrivileged": Target_evaluatePrivileged,
++  "Target.getCurrentMessageContents": Target_getCurrentMessageContents,
++  "Target.getSourceMapURL": Target_getSourceMapURL,
++  "Target.getStepOffsets": Target_getStepOffsets,
++  "Target.topFrameLocation": Target_topFrameLocation,
++  "Pause.evaluateInFrame": Pause_evaluateInFrame,
++  "Pause.evaluateInGlobal": Pause_evaluateInGlobal,
++  "Pause.getAllFrames": Pause_getAllFrames,
++  "Pause.getExceptionValue": Pause_getExceptionValue,
++  "Pause.getObjectPreview": Pause_getObjectPreview,
++  "Pause.getObjectProperty": Pause_getObjectProperty,
++  "Pause.getScope": Pause_getScope,
++};
++
++function commandCallback(method, params) {
++  if (!CommandCallbacks[method]) {
++    log(`Missing command callback: ${method}`);
++    return {};
++  }
++
++  try {
++    return CommandCallbacks[method](params);
++  } catch (e) {
++    log(`Error: Command exception ${method} ${e}`);
++    return {};
++  }
++}
++
++function Target_countStackFrames() {
++  const count = getStackFrames().length;
++  return { count };
++}
++
++function Target_evaluatePrivileged({ expression }) {
++  const result = eval(expression);
++  return { result };
++}
++
++// Levels of console messages by the type of their Runtime.consoleAPICalled
++// event. Other types are reported as "info".
++const cdpToRrpConsoleLevels = new Map([
++  ["info", "info"],
++  ["warning", "warning"],
++  ["error", "error"],
++  ["timeEnd", "timeEnd"],
++]);
++
++// Contents of the last console API call. Runtime.consoleAPICalled will be
++// emitted before the driver gets the current message contents.
++let gLastConsoleAPICall;
++
++function onConsoleAPICall(params) {
++  gLastConsoleAPICall = params;
++}
++
++function Target_getCurrentMessageContents() {
++  // We could be getting the contents of either an error object that was reported
++  // to the driver via C++, or a console API call that was reported to the driver
++  // via onConsoleAPICall().
++  const error = process.recordreplay._getCurrentError();
++
++  if (error) {
++    const { message, filename, line, column, scriptId } = error;
++    return {
++      source: "PageError",
++      level: "error",
++      text: message,
++      url: filename,
++      sourceId: scriptId ? scriptId.toString() : undefined,
++      line,
++      column,
++    };
++  }
++
++  // Look for the "args" variable on an onConsoleMessage frame.
++  // The arguments are also stored on the last console API call, though
++  // if we use that we need to be careful because the pause state could have
++  // been cleared since the last Runtime.consoleAPICalled event.
++  const { callFrames } = sendMessage("Debugger.getCallFrames");
++  const consoleMessageFrame = callFrames.find(
++    frame => frame.functionName == "onConsoleMessage"
++  );
++  assert(consoleMessageFrame);
++  assert(consoleMessageFrame.this.type == "object");
++  assert(consoleMessageFrame.this.className == "Array");
++  const argumentsId = consoleMessageFrame.this.objectId;
++
++  // Get the properties of the message arguments array.
++  const argumentsProperties = sendMessage("Runtime.getProperties", {
++    objectId: argumentsId,
++    ownProperties: true,
++    generatePreview: false,
++  }).result;
++
++  // Get the protocol representation of the message arguments.
++  const argumentValues = [];
++  for (let i = 0;; i++) {
++    const property = argumentsProperties.find(prop => prop.name == i.toString());
++    if (!property) {
++      break;
++    }
++    argumentValues.push(remoteObjectToProtocolValue(property.value));
++  }
++
++  const level = cdpToRrpConsoleLevels.get(gLastConsoleAPICall.type) || "info";
++
++  let url, sourceId, line, column;
++  if (gLastConsoleAPICall.stackTrace) {
++    const frame = gLastConsoleAPICall.stackTrace.callFrames[0];
++    if (frame) {
++      url = frame.url;
++      sourceId = frame.scriptId;
++      line = frame.lineNumber;
++      column = frame.columnNumber;
++    }
++  }
++
++  return {
++    source: "ConsoleAPI",
++    level,
++    text: "",
++    url,
++    sourceId,
++    line,
++    column,
++    argumentValues,
++  };
++}
++
++function Target_getSourceMapURL({ sourceId }) {
++  const url = getSourceMapURL(sourceId);
++  return { url, baseUrl: url };
++}
++
++function Target_getStepOffsets() {
++  // CDP does not distinguish between steps and breakpoints.
++  return {};
++}
++
++function Target_topFrameLocation() {
++  const { callFrames } = sendMessage("Debugger.getCallFrames", { noContents: true });
++
++  for (const { location } of callFrames) {
++    if (!process.recordreplay._ignoreScript(location.scriptId)) {
++      return { location: createProtocolLocation(location)[0] };
++    }
++  }
++
++  return {};
++}
++
++// Get the raw call frames on the stack, eliding ones in scripts we are ignoring.
++function getStackFrames() {
++  const { callFrames } = sendMessage("Debugger.getCallFrames");
++
++  const frames = [];
++  for (const frame of callFrames) {
++    if (!process.recordreplay._ignoreScript(frame.location.scriptId)) {
++      frames.push(frame);
++    }
++  }
++  return frames;
++}
++
++// Build a protocol Result object from a result/exceptionDetails CDP rval.
++function buildProtocolResult({ result, exceptionDetails }) {
++  const value = remoteObjectToProtocolValue(result);
++  const protocolResult = { data: {} };
++
++  if (exceptionDetails) {
++    protocolResult.exception = value;
++  } else {
++    protocolResult.returned = value;
++  }
++  return { result: protocolResult };
++}
++
++function Pause_evaluateInFrame({ frameId, expression }) {
++  const frames = getStackFrames();
++  const index = +frameId;
++  assert(index < frames.length);
++  const frame = frames[index];
++
++  const rv = doEvaluation();
++  return buildProtocolResult(rv);
++
++  function doEvaluation() {
++    // In order to do the evaluation in the right frame, the same number of
++    // frames need to be on V8's stack when we do the evaluation as when we got
++    // the stack frames in the first place. The debugger agent extracts a frame
++    // index from the ID it is given and uses that to walk the stack to the
++    // frame where it will do the evaluation (see DebugStackTraceIterator).
++    return sendMessage(
++      "Debugger.evaluateOnCallFrame",
++      {
++        callFrameId: frame.callFrameId,
++        expression,
++      }
++    );
++  }
++}
++
++function Pause_evaluateInGlobal({ expression }) {
++  const rv = sendMessage("Runtime.evaluate", { expression });
++  return buildProtocolResult(rv);
++}
++
++function Pause_getAllFrames() {
++  const frames = getStackFrames().map((frame, index) => {
++    // Use our own IDs for frames.
++    const id = (index++).toString();
++    return createProtocolFrame(id, frame);
++  });
++
++  return {
++    frames: frames.map(f => f.frameId),
++    data: { frames },
++  };
++}
++
++function Pause_getExceptionValue() {
++  const rv = sendMessage("Debugger.getPendingException", {});
++  return { exception: remoteObjectToProtocolValue(rv.exception), data: {} };
++}
++
++function Pause_getObjectPreview({ object, level = "full" }) {
++  const objectData = createProtocolObject(object, level);
++  return { data: { objects: [objectData] } };
++}
++
++function Pause_getObjectProperty({ object, name }) {
++  const obj = protocolIdToRemoteObject(object);
++  const rv = sendMessage(
++    "Runtime.callFunctionOn",
++    {
++      functionDeclaration: `function() { return this["${name}"] }`,
++      objectId: obj.objectId,
++    }
++  );
++  return buildProtocolResult(rv);
++}
++
++function Pause_getScope({ scope }) {
++  const scopeData = createProtocolScope(scope);
++  return { data: { scopes: [scopeData] } };
++}
++
++module.exports = {
++  initializeRecordReplay,
++};
+diff --git a/lib/internal/recordreplay/message.js b/lib/internal/recordreplay/message.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..91d87d066c5f7b7157a35d50c7799e34ec084435
+--- /dev/null
++++ b/lib/internal/recordreplay/message.js
+@@ -0,0 +1,50 @@
++// Interface for sending/receiving CDP messages.
++
++const { log, assert } = require("internal/recordreplay/utils");
++
++function initMessages() {
++  process.recordreplay._setCDPMessageCallback(messageCallback);
++}
++
++let gNextMessageId = 1;
++
++let gCurrentMessageId;
++let gCurrentMessageResult;
++
++function sendMessage(method, params) {
++  const id = gNextMessageId++;
++  gCurrentMessageId = id;
++  process.recordreplay._sendCDPMessage(JSON.stringify({ method, params, id }));
++  gCurrentMessageId = undefined;
++  return gCurrentMessageResult;
++}
++
++const gEventListeners = new Map();
++
++function addEventListener(method, callback) {
++  gEventListeners.set(method, callback);
++}
++
++function messageCallback(message) {
++  try {
++    message = JSON.parse(message);
++
++    if (message.id) {
++      assert(message.id == gCurrentMessageId);
++      gCurrentMessageResult = message.result;
++    } else {
++      const listener = gEventListeners.get(message.method);
++      if (listener) {
++        listener(message.params);
++      }
++    }
++  } catch (e) {
++    log(`Message callback exception: ${e}`);
++  }
++}
++
++module.exports = {
++  initMessages,
++  sendMessage,
++  addEventListener,
++};
+diff --git a/lib/internal/recordreplay/object.js b/lib/internal/recordreplay/object.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..5ded9a51d890508e54839bf71523c23cff721ea2
+--- /dev/null
++++ b/lib/internal/recordreplay/object.js
+@@ -0,0 +1,102 @@
++// Manage association between remote objects and protocol object IDs.
++
++const { assert, log } = require("internal/recordreplay/utils");
++
++// Map protocol ObjectId => RemoteObject
++const gProtocolIdToObject = new Map();
++
++// Map RemoteObject.objectId => protocol ObjectId
++const gObjectIdToProtocolId = new Map();
++
++// Map protocol ScopeId => Debugger.Scope
++const gProtocolIdToScope = new Map();
++
++let gNextObjectId = 1;
++
++function clearPauseDataCallback() {
++  gProtocolIdToObject.clear();
++  gObjectIdToProtocolId.clear();
++  gProtocolIdToScope.clear();
++  gNextObjectId = 1;
++}
++
++function remoteObjectToProtocolId(remoteObject) {
++  assert(remoteObject.objectId);
++
++  const existing = gObjectIdToProtocolId.get(remoteObject.objectId);
++  if (existing) {
++    return existing;
++  }
++
++  const protocolObjectId = (gNextObjectId++).toString();
++  gObjectIdToProtocolId.set(remoteObject.objectId, protocolObjectId);
++  gProtocolIdToObject.set(protocolObjectId, remoteObject);
++
++  return protocolObjectId;
++}
++
++function protocolIdToRemoteObject(objectId) {
++  const remoteObject = gProtocolIdToObject.get(objectId);
++  assert(remoteObject);
++  return remoteObject;
++}
++
++// Strings longer than this will be truncated when creating protocol values.
++const MaxStringLength = 10000;
++
++function remoteObjectToProtocolValue(obj) {
++  switch (obj.type) {
++    case "undefined":
++      return {};
++    case "string":
++    case "number":
++    case "boolean":
++      if (obj.unserializableValue) {
++        assert(obj.type == "number");
++        return { unserializableNumber: obj.unserializableValue };
++      }
++      if (typeof obj.value == "string" && obj.value.length > MaxStringLength) {
++        return { value: obj.value.substring(0, MaxStringLength) + "…" };
++      }
++      return { value: obj.value };
++    case "bigint": {
++      const str = obj.unserializableValue;
++      assert(str);
++      return { bigint: str.substring(0, str.length - 1) };
++    }
++    case "object":
++    case "function": {
++      if (!obj.objectId) {
++        return { value: null };
++      }
++      const object = remoteObjectToProtocolId(obj);
++      return { object };
++    }
++    case "symbol":
++      return { symbol: obj.description };
++    default:
++      return { unavailable: true };
++  }
++}
++
++function scopeToProtocolId(scope) {
++  // Use the scope object's ID as the ID for the scope itself.
++  const id = remoteObjectToProtocolId(scope.object);
++  gProtocolIdToScope.set(id, scope);
++  return id;
++}
++
++function protocolIdToScope(scopeId) {
++  const scope = gProtocolIdToScope.get(scopeId);
++  assert(scope);
++  return scope;
++}
++
++module.exports = {
++  remoteObjectToProtocolId,
++  protocolIdToRemoteObject,
++  remoteObjectToProtocolValue,
++  scopeToProtocolId,
++  protocolIdToScope,
++  clearPauseDataCallback,
++};
+diff --git a/lib/internal/recordreplay/preview.js b/lib/internal/recordreplay/preview.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..7751cdeb0ed3b6da8ccdc6778695536c108ede66
+--- /dev/null
++++ b/lib/internal/recordreplay/preview.js
+@@ -0,0 +1,363 @@
++// Logic for creating object previews for the record/replay protocol.
++
++const {
++  protocolIdToRemoteObject,
++  remoteObjectToProtocolId,
++  remoteObjectToProtocolValue,
++  scopeToProtocolId,
++  protocolIdToScope,
++} = require("internal/recordreplay/object");
++const { sendMessage } = require("internal/recordreplay/message");
++const { log } = require("internal/recordreplay/utils");
++
++function createProtocolObject(objectId, level) {
++  const obj = protocolIdToRemoteObject(objectId);
++  const className = obj.subtype == "proxy" ? "Proxy" : (obj.className || "Function");
++
++  let preview;
++  if (level != "none") {
++    preview = new ProtocolObjectPreview(obj, level).fill();
++  }
++
++  return { objectId, className, preview };
++}
++
++// Target limit for the number of items (properties etc.) to include in object
++// previews before overflowing.
++const MaxItems = {
++  "noProperties": 0,
++
++  // Note: this is higher than on gecko-dev because typed arrays don't render
++  // properly in the devtools currently unless we include a minimum number of
++  // properties. This would be nice to fix.
++  "canOverflow": 10,
++
++  "full": 1000,
++};
++
++function ProtocolObjectPreview(obj, level) {
++  this.obj = obj;
++  this.level = level;
++  this.overflow = false;
++  this.numItems = 0;
++  this.extra = {};
++}
++
++ProtocolObjectPreview.prototype = {
++  canAddItem(force) {
++    if (!force && this.numItems >= MaxItems[this.level]) {
++      this.overflow = true;
++      return false;
++    }
++    this.numItems++;
++    return true;
++  },
++
++  addProperty(property, force) {
++    if (!this.canAddItem(force)) {
++      return;
++    }
++    if (!this.properties) {
++      this.properties = [];
++    }
++    this.properties.push(property);
++  },
++
++  addContainerEntry(entry) {
++    if (!this.canAddItem()) {
++      return;
++    }
++    if (!this.containerEntries) {
++      this.containerEntries = [];
++    }
++    this.containerEntries.push(entry);
++  },
++
++  fill() {
++    const allProperties = sendMessage("Runtime.getProperties", {
++      objectId: this.obj.objectId,
++      ownProperties: true,
++      generatePreview: false,
++    });
++    const properties = allProperties.result;
++
++    // Add class-specific data.
++    const previewer = CustomPreviewers[this.obj.className];
++    const requiredProperties = [];
++    if (previewer) {
++      for (const entry of previewer) {
++        if (typeof entry == "string") {
++          requiredProperties.push(entry);
++        } else {
++          entry.call(this, allProperties);
++        }
++      }
++    }
++
++    let prototype;
++    for (const prop of properties) {
++      if (prop.name == "__proto__") {
++        prototype = prop;
++      } else {
++        const protocolProperty = createProtocolPropertyDescriptor(prop);
++        const force = requiredProperties.includes(prop.name);
++        this.addProperty(protocolProperty, force);
++      }
++    }
++
++    let prototypeId;
++    if (prototype && prototype.value && prototype.value.objectId) {
++      prototypeId = remoteObjectToProtocolId(prototype.value);
++    }
++    return {
++      prototypeId,
++      overflow: (this.overflow && this.level != "full") ? true : undefined,
++      properties: this.properties,
++      containerEntries: this.containerEntries,
++      ...this.extra,
++    };
++  },
++};
++
++// Get a count from an object description like "Array(42)"
++function getDescriptionCount(description) {
++  const match = /\((\d+)\)/.exec(description || "");
++  if (match) {
++    return +match[1];
++  }
++}
++
++function previewTypedArray() {
++  // The typed array size isn't available from the object's own property
++  // information, except by parsing the object description.
++  const length = getDescriptionCount(this.obj.description);
++  if (length !== undefined) {
++    this.addProperty({ name: "length", value: length }, /* force */ true);
++  }
++}
++
++function previewSetMap(allProperties) {
++  if (!allProperties.internalProperties) {
++    return;
++  }
++
++  const internal = allProperties.internalProperties.find(prop => prop.name == "[[Entries]]");
++  if (!internal || !internal.value || !internal.value.objectId) {
++    return;
++  }
++
++  // Get the container size from the length of the entries.
++  const size = getDescriptionCount(internal.value.description);
++  if (size !== undefined) {
++    this.extra.containerEntryCount = size;
++    if (["Set", "Map"].includes(this.obj.className)) {
++      this.addProperty({ name: "size", value: size }, /* force */ true);
++    }
++  }
++
++  const entries = sendMessage("Runtime.getProperties", {
++    objectId: internal.value.objectId,
++    ownProperties: true,
++    generatePreview: false,
++  }).result;
++
++  for (const entry of entries) {
++    if (entry.value.subtype == "internal#entry") {
++      const entryProperties = sendMessage("Runtime.getProperties", {
++        objectId: entry.value.objectId,
++        ownProperties: true,
++        generatePreview: false,
++      }).result;
++      const key = entryProperties.find(eprop => eprop.name == "key");
++      const value = entryProperties.find(eprop => eprop.name == "value");
++      if (value) {
++        this.addContainerEntry({
++          key: key ? remoteObjectToProtocolValue(key.value) : undefined,
++          value: remoteObjectToProtocolValue(value.value),
++        });
++      }
++    }
++    if (this.overflow) {
++      break;
++    }
++  }
++}
++
++function previewRegExp() {
++  this.extra.regexpString = this.obj.description;
++}
++
++function previewDate() {
++  const dateTime = Date.parse(this.obj.description);
++  if (!Number.isNaN(dateTime)) {
++    this.extra.dateTime = dateTime;
++  }
++}
++
++function previewError() {
++  this.addProperty({ name: "name", value: this.obj.className }, /* force */ true);
++}
++
++const ErrorProperties = [
++  "message",
++  "stack",
++  previewError,
++];
++
++function previewFunction(allProperties) {
++  const nameProperty = allProperties.result.find(prop => prop.name == "name");
++  if (nameProperty) {
++    this.extra.functionName = nameProperty.value.value;
++  }
++
++  const locationProperty = allProperties.internalProperties.find(
++    prop => prop.name == "[[FunctionLocation]]"
++  );
++  if (locationProperty) {
++    this.extra.functionLocation = createProtocolLocation(locationProperty.value.value);
++  }
++}
++
++const CustomPreviewers = {
++  Array: ["length"],
++  Int8Array: [previewTypedArray],
++  Uint8Array: [previewTypedArray],
++  Uint8ClampedArray: [previewTypedArray],
++  Int16Array: [previewTypedArray],
++  Uint16Array: [previewTypedArray],
++  Int32Array: [previewTypedArray],
++  Uint32Array: [previewTypedArray],
++  Float32Array: [previewTypedArray],
++  Float64Array: [previewTypedArray],
++  BigInt64Array: [previewTypedArray],
++  BigUint64Array: [previewTypedArray],
++  Map: [previewSetMap],
++  WeakMap: [previewSetMap],
++  Set: [previewSetMap],
++  WeakSet: [previewSetMap],
++  RegExp: [previewRegExp],
++  Date: [previewDate],
++  Error: ErrorProperties,
++  EvalError: ErrorProperties,
++  RangeError: ErrorProperties,
++  ReferenceError: ErrorProperties,
++  SyntaxError: ErrorProperties,
++  TypeError: ErrorProperties,
++  URIError: ErrorProperties,
++  Function: [previewFunction],
++};
++
++function createProtocolPropertyDescriptor(desc) {
++  const { name, value, writable, get, set, configurable, enumerable, symbol } = desc;
++
++  const rv = value ? remoteObjectToProtocolValue(value) : {};
++  rv.name = name;
++
++  let flags = 0;
++  if (writable) {
++    flags |= 1;
++  }
++  if (configurable) {
++    flags |= 2;
++  }
++  if (enumerable) {
++    flags |= 4;
++  }
++  if (flags != 7) {
++    rv.flags = flags;
++  }
++
++  if (get && get.objectId) {
++    rv.get = remoteObjectToProtocolId(get);
++  }
++  if (set && set.objectId) {
++    rv.set = remoteObjectToProtocolId(set);
++  }
++
++  if (symbol) {
++    rv.isSymbol = true;
++  }
++
++  return rv;
++}
++
++function createProtocolLocation(location) {
++  if (!location) {
++    return undefined;
++  }
++  const { scriptId, lineNumber, columnNumber } = location;
++  return [{
++    sourceId: scriptId,
++    // CDP line numbers are 0-indexed, while RRP line numbers are 1-indexed.
++    line: lineNumber + 1,
++    column: columnNumber,
++  }];
++}
++
++function createProtocolFrame(frameId, frame) {
++  // CDP call frames don't provide detailed type information.
++  const type = frame.functionName ? "call" : "global";
++
++  return {
++    frameId,
++    type,
++    functionName: frame.functionName || undefined,
++    functionLocation: createProtocolLocation(frame.functionLocation),
++    location: createProtocolLocation(frame.location),
++    scopeChain: frame.scopeChain.map(scopeToProtocolId),
++    this: remoteObjectToProtocolValue(frame.this),
++  };
++}
++
++function createProtocolScope(scopeId) {
++  const scope = protocolIdToScope(scopeId);
++
++  let type;
++  switch (scope.type) {
++    case "global":
++      type = "global";
++      break;
++    case "with":
++      type = "with";
++      break;
++    default:
++      type = scope.name ? "function" : "block";
++      break;
++  }
++
++  let object, bindings;
++  if (type == "global" || type == "with") {
++    object = remoteObjectToProtocolId(scope.object);
++  } else {
++    bindings = [];
++
++    const properties = sendMessage("Runtime.getProperties", {
++      objectId: scope.object.objectId,
++      ownProperties: true,
++      generatePreview: false,
++    }).result;
++    for (const { name, value } of properties) {
++      // CDP omits the value of a binding it can't describe, such as a dead
++      // register an async function restored when resuming in the interpreter.
++      const converted = value
++        ? remoteObjectToProtocolValue(value)
++        : { unavailable: true };
++      bindings.push({ ...converted, name });
++    }
++  }
++
++  return {
++    scopeId,
++    type,
++    object,
++    functionName: scope.name || undefined,
++    bindings,
++  };
++}
++
++module.exports = {
++  createProtocolObject,
++  createProtocolFrame,
++  createProtocolLocation,
++  createProtocolScope,
++};
+diff --git a/lib/internal/recordreplay/sourcemap.js b/lib/internal/recordreplay/sourcemap.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..475f149be26f2f83821b7c21c772b52486c0473b
+--- /dev/null
++++ b/lib/internal/recordreplay/sourcemap.js
+@@ -0,0 +1,232 @@
++const crypto = require("crypto");
++const fs = require("fs");
++const path = require("path");
++const { fileURLToPath, pathToFileURL } = require("url");
++const { assert, log } = require("internal/recordreplay/utils");
++
++const sourceMapInfos = new Map();
++
++function getSourceMapURL(sourceId) {
++  return sourceMapInfos.get(sourceId)?.sourceMapURL;
++}
++
++function registerSourceMap(ev) {
++  if (!ev.sourceMapURL) {
++    return;
++  }
++
++  const { url: sourceURL, scriptId } = ev;
++  const sourceBaseURL = sourceURL && isValidBaseURL(sourceURL) ? sourceURL : pathToFileURL(process.cwd());
++
++  let sourceMapURL;
++  try {
++    sourceMapURL = new URL(ev.sourceMapURL, sourceBaseURL).toString();
++  } catch (err) {
++    log("Failed to process sourcemap url: " + err.message);
++    return;
++  }
++
++  sourceMapInfos.set(scriptId, { sourceURL, sourceMapURL });
++}
++
++function processSourceMaps() {
++  for (const { sourceURL, sourceMapURL } of sourceMapInfos.values()) {
++    processSourceMap(sourceURL, sourceMapURL);
++  }
++}
++
++function processSourceMap(sourceURL, sourceMapURL) {
++  if (!sourceURL?.startsWith("file://") || !sourceMapURL.startsWith("file://")) {
++    return;
++  }
++
++  const sourcePath = fileURLToPath(sourceURL);
++  let script;
++  try {
++    script = fs.readFileSync(sourcePath, "utf8");
++  } catch (err) {
++    log(`Failed to read source ${sourcePath}: ${err.message}`);
++  }
++  if (!script) {
++    return;
++  }
++
++  const sourceMapPath = fileURLToPath(sourceMapURL);
++  let sourceMap;
++  try {
++    sourceMap = fs.readFileSync(sourceMapPath, "utf8");
++  } catch (err) {
++    log(`Failed to read sourcemap ${sourceMapPath}: ${err.message}`);
++  }
++  if (!sourceMap) {
++    return;
++  }
++
++  const recordingId = process.recordreplay.recordingId();
++  const id = String(Math.floor(Math.random() * 10000000000));
++  const name = `sourcemap-${id}.map`;
++  const path = writeToRecordingDirectory(name, sourceMap);
++  addRecordingEvent({
++    kind: "sourcemapAdded",
++    path,
++    recordingId,
++    id,
++    url: sourceMapURL,
++    baseURL: sourceMapURL,
++    targetContentHash: makeAPIHash(script),
++    targetURLHash: makeAPIHash(sourceURL),
++    targetMapURLHash: makeAPIHash(sourceMapURL),
++  });
++
++  const { sources } = collectUnresolvedSourceMapResources(sourceMap, sourceMapURL);
++
++  for (const { offset, url } of sources) {
++    const sourcePath = fileURLToPath(url);
++    let sourceContent;
++    try {
++      sourceContent = fs.readFileSync(sourcePath, "utf8");
++    } catch (err) {
++      log(`Failed to read original source ${sourcePath}: ${err.message}`);
++      continue;
++    }
++    const sourceId = String(Math.floor(Math.random() * 10000000000));
++    const name = `original-source-${id}-${sourceId}`;
++    const path = writeToRecordingDirectory(name, sourceContent);
++    addRecordingEvent({
++      kind: "originalSourceAdded",
++      path,
++      recordingId,
++      parentId: id,
++      parentOffset: offset,
++    });
++  }
++}
++
++function isValidBaseURL(url) {
++  try {
++    new URL("", url);
++    return true;
++  } catch {
++    return false;
++  }
++}
++
++function makeAPIHash(content) {
++  assert(typeof content === "string");
++  return "sha256:" + crypto.createHash('sha256').update(content).digest('hex');
++}
++
++function getRecordingDirectory() {
++  // see matching logic in recordreplay::InitializeRecordingEvents() in the backend,
++  // in getRecordingDirectory() in gecko-dev and in getDirectory() in the recordings cli
++  const recordingDir = process.env["RECORD_REPLAY_DIRECTORY"];
++  if (recordingDir) {
++    return recordingDir;
++  }
++  const homeDir = process.env["HOME"] || process.env["USERPROFILE"];
++  if (!homeDir) {
++    log("NoRecordingDirectory");
++    return undefined;
++  }
++  return path.join(homeDir, ".replay");
++}
++
++function addRecordingEvent(event) {
++  const recordingDir = getRecordingDirectory();
++  if (!recordingDir) {
++    return;
++  }
++  const filepath = path.join(recordingDir, "recordings.log");
++  fs.appendFileSync(filepath, JSON.stringify(event) + "\n");
++}
++
++function writeToRecordingDirectory(filename, contents) {
++  const recordingDir = getRecordingDirectory();
++  if (!recordingDir) {
++    return;
++  }
++  try {
++    fs.mkdirSync(recordingDir);
++  } catch {}
++  const filepath = path.join(recordingDir, filename);
++  fs.writeFileSync(filepath, contents);
++  return filepath;
++}
++
++function collectUnresolvedSourceMapResources(mapText, mapURL) {
++  let obj;
++  try {
++    obj = JSON.parse(mapText);
++    if (typeof obj !== "object" || !obj) {
++      return {
++        sources: [],
++      };
++    }
++  } catch (err) {
++    log(`Exception parsing sourcemap JSON (${mapURL})`);
++    return {
++      sources: [],
++    };
++  }
++
++  function logError(msg) {
++    log(`${msg} (${mapURL}:${sourceOffset})`);
++  }
++
++  const unresolvedSources = [];
++  let sourceOffset = 0;
++
++  if (obj.version !== 3) {
++    logError("Invalid sourcemap version");
++    return {
++      sources: [],
++    };
++  }
++
++  if (obj.sources != null) {
++    const { sourceRoot, sources, sourcesContent } = obj;
++
++    if (Array.isArray(sources)) {
++      for (let i = 0; i < sources.length; i++) {
++        const offset = sourceOffset++;
++
++        if (
++          !Array.isArray(sourcesContent) ||
++          typeof sourcesContent[i] !== "string"
++        ) {
++          let url = sources[i];
++          if (typeof sourceRoot === "string" && sourceRoot) {
++            url = sourceRoot.replace(/\/?/, "/") + url;
++          }
++          let sourceURL;
++          try {
++            sourceURL = new URL(url, mapURL).toString();
++          } catch {
++            logError("Unable to compute original source URL: " + url);
++            continue;
++          }
++          if(!sourceURL.startsWith("file://")) {
++            continue;
++          }
++
++          unresolvedSources.push({
++            offset,
++            url: sourceURL,
++          });
++        }
++      }
++    } else {
++      logError("Invalid sourcemap source list");
++    }
++  }
++
++  return {
++    sources: unresolvedSources,
++  };
++}
++
++module.exports = {
++  registerSourceMap,
++  processSourceMaps,
++  getSourceMapURL,
++};
+diff --git a/lib/internal/recordreplay/utils.js b/lib/internal/recordreplay/utils.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..2cef613d38207e5c788390f788e7b725e96c4c21
+--- /dev/null
++++ b/lib/internal/recordreplay/utils.js
+@@ -0,0 +1,13 @@
++
++function assert(v) {
++  if (!v) {
++    log(`Assertion failed ${Error().stack}`);
++    throw new Error("Assertion failed");
++  }
++}
++
++function log(text) {
++  process.recordreplay.log(text);
++}
++
++module.exports = { assert, log };
+diff --git a/src/inspector/node_string.cc b/src/inspector/node_string.cc
+index 4cb8b573cc1312e67285e57ecc2d40c18e057a66..74e56eac9339fa9051219c57f38815d9063125e2 100644
+--- a/src/inspector/node_string.cc
++++ b/src/inspector/node_string.cc
+@@ -77,11 +77,18 @@ String fromDouble(double d) {
+ }
+ 
+ double toDouble(const char* buffer, size_t length, bool* ok) {
++  // Workaround problems using istringstream when replaying. This needs to get fixed.
++  /*
+   std::istringstream stream(std::string(buffer, length));
+   stream.imbue(std::locale::classic());  // Ignore current locale
+   double d;
+   stream >> d;
+   *ok = !stream.fail();
++  */
++  std::string str(buffer, length);
++  char* end;
++  double d = strtod(str.c_str(), &end);
++  *ok = end != str.c_str();
+   return d;
+ }
+ 
+diff --git a/src/node.cc b/src/node.cc
+index 69e817c8031078feecbf49da516b293ac6fbf5b4..0983fc32f572ea9978918abd19c343bb011b41ab 100644
+--- a/src/node.cc
++++ b/src/node.cc
+@@ -454,6 +454,10 @@ MaybeLocal<Value> StartExecution(Environment* env, const char* main_script_id) {
+ }
+ 
+ MaybeLocal<Value> StartExecution(Environment* env, StartExecutionCallback cb) {
++  if (v8::IsMainThread()) {
++    v8::recordreplay::NewCheckpoint();
++  }
++
+   InternalCallbackScope callback_scope(
+       env,
+       Object::New(env->isolate()),
+diff --git a/src/node_errors.cc b/src/node_errors.cc
+index 8c29dd854862c1abcfa2fd8e0f73791ce7e0f970..064a9756f6869468fcd61d0022feedb51bc88be1 100644
+--- a/src/node_errors.cc
++++ b/src/node_errors.cc
+@@ -966,6 +966,8 @@ void DecorateErrorStack(Environment* env,
+       env->context(), env->decorated_private_symbol(), True(env->isolate()));
+ }
+ 
++extern "C" void V8RecordReplayOnErrorEvent(Local<Message> message);
++
+ void TriggerUncaughtException(Isolate* isolate,
+                               Local<Value> error,
+                               Local<Message> message,
+@@ -1044,6 +1046,8 @@ void TriggerUncaughtException(Isolate* isolate,
+     return;
+   }
+ 
++  V8RecordReplayOnErrorEvent(message);
++
+   // Now we are certain that the exception is fatal.
+   ReportFatalException(env, error, message, EnhanceFatalException::kEnhance);
+   RunAtExit(env);
+diff --git a/src/node_internals.h b/src/node_internals.h
+index 99258ad0aa1e15ea1ba139fd0e83111e1436cc40..02a9e625b8643a6e3b01b1f28a546a7e7c0bd996 100644
+--- a/src/node_internals.h
++++ b/src/node_internals.h
+@@ -408,6 +408,18 @@ std::string Basename(const std::string& str, const std::string& extension);
+ 
+ node_module napi_module_to_node_module(const napi_module* mod);
+ 
++namespace recordreplay {
++
++// Throws a TypeError and returns true where the recording can't be used, e.g.
++// in an evaluation while paused, where operation_name would otherwise report
++// (or change) the replaying process instead of the recorded one. Matches
++// RecordReplayThrowIfEventsUnavailable in the Chromium fork.
++bool ThrowIfEventsUnavailable(Environment* env, const char* operation_name);
++bool ThrowIfEventsUnavailable(const v8::FunctionCallbackInfo<v8::Value>& args,
++                              const char* operation_name);
++
++}  // namespace recordreplay
++
+ }  // namespace node
+ 
+ #endif  // defined(NODE_WANT_INTERNALS) && NODE_WANT_INTERNALS
+diff --git a/src/node_native_module.cc b/src/node_native_module.cc
+index c836540c7d9328ae4646097ecc18023c1d8add8f..d5932fd4c1e436eb5bcd193bbfd1f8bb4afc96e8 100644
+--- a/src/node_native_module.cc
++++ b/src/node_native_module.cc
+@@ -258,7 +258,11 @@ MaybeLocal<Function> NativeModuleLoader::LookupAndCompile(
+   ScriptOrigin origin(isolate, filename, 0, 0, true);
+ 
+   ScriptCompiler::CachedData* cached_data = nullptr;
+-  {
++
++  // Avoid using code cache when recording/replaying, as generated bytecode
++  // depends on the running thread and we might end up running code compiled
++  // by the main thread on a worker thread.
++  if (!v8::recordreplay::IsRecordingOrReplaying()) {
+     // Note: The lock here should not extend into the
+     // `CompileFunctionInContext()` call below, because this function may
+     // recurse if there is a syntax error during bootstrap (because the fatal
+diff --git a/src/node_process_methods.cc b/src/node_process_methods.cc
+index bc5d41382f20f1f90894b59df68b6ae08096315c..fb35319bdcd3f59b23161dade084fb95b8e25bbc 100644
+--- a/src/node_process_methods.cc
++++ b/src/node_process_methods.cc
+@@ -62,6 +62,9 @@ Mutex umask_mutex;
+ #define NANOS_PER_SEC 1000000000
+ 
+ static void Abort(const FunctionCallbackInfo<Value>& args) {
++  if (recordreplay::ThrowIfEventsUnavailable(args, "process.abort")) {
++    return;
++  }
+   Abort();
+ }
+ 
+@@ -74,6 +77,9 @@ static void CauseSegfault(const FunctionCallbackInfo<Value>& args) {
+ 
+ static void Chdir(const FunctionCallbackInfo<Value>& args) {
+   Environment* env = Environment::GetCurrent(args);
++  if (recordreplay::ThrowIfEventsUnavailable(env, "process.chdir")) {
++    return;
++  }
+   CHECK(env->owns_process_state());
+ 
+   CHECK_EQ(args.Length(), 1);
+@@ -141,6 +147,9 @@ static void Cwd(const FunctionCallbackInfo<Value>& args) {
+ 
+ static void Kill(const FunctionCallbackInfo<Value>& args) {
+   Environment* env = Environment::GetCurrent(args);
++  if (recordreplay::ThrowIfEventsUnavailable(env, "process.kill")) {
++    return;
++  }
+   Local<Context> context = env->context();
+ 
+   if (args.Length() < 2) {
+@@ -441,6 +450,9 @@ static void DebugEnd(const FunctionCallbackInfo<Value>& args) {
+ 
+ static void ReallyExit(const FunctionCallbackInfo<Value>& args) {
+   Environment* env = Environment::GetCurrent(args);
++  if (recordreplay::ThrowIfEventsUnavailable(env, "process.exit")) {
++    return;
++  }
+   RunAtExit(env);
+   int code = args[0]->Int32Value(env->context()).FromMaybe(0);
+   env->Exit(code);
+@@ -550,6 +562,11 @@ void BindingData::Deserialize(Local<Context> context,
+   CHECK_NOT_NULL(binding);
+ }
+ 
++// See node_recordreplay.cc.
++void InitializeRecordReplayMethods(Environment* env, Local<Object> target);
++void RegisterRecordReplayExternalReferences(
++    ExternalReferenceRegistry* registry);
++
+ static void Initialize(Local<Object> target,
+                        Local<Value> unused,
+                        Local<Context> context,
+@@ -587,6 +604,7 @@ static void Initialize(Local<Object> target,
+   env->SetMethod(target, "reallyExit", ReallyExit);
+   env->SetMethodNoSideEffect(target, "uptime", Uptime);
+   env->SetMethod(target, "patchProcessObject", PatchProcessObject);
++  InitializeRecordReplayMethods(env, target);
+ }
+ 
+ void RegisterExternalReferences(ExternalReferenceRegistry* registry) {
+@@ -616,6 +634,7 @@ void RegisterExternalReferences(ExternalReferenceRegistry* registry) {
+   registry->Register(ReallyExit);
+   registry->Register(Uptime);
+   registry->Register(PatchProcessObject);
++  RegisterRecordReplayExternalReferences(registry);
+ }
+ 
+ }  // namespace process
+diff --git a/src/node_recordreplay.cc b/src/node_recordreplay.cc
+new file mode 100644
+index 0000000000000000000000000000000000000000..9fc85ce8d389ff044c9ddd9ecc23c7c7d318bda8
+--- /dev/null
++++ b/src/node_recordreplay.cc
+@@ -0,0 +1,251 @@
++// Replay's debugger, for the Node in an Electron browser process: the process
++// binding's record/replay methods. From src/node_recordreplay.cc in Replay's Node.
++//
++// That fork also annotates Node's threads and its GC callbacks so that they're
++// the same when replaying, and loads the driver at startup. An Electron browser
++// process needs none of that: it attaches before anything runs (see
++// shell/app/replay_attach_mac.c), its recorded threads run one at a time, and
++// V8 does the same things on both sides (see recordreplay::IsSameOnBothSides).
++// So this is the only part of that fork it has.
++
++#include "env-inl.h"
++#include "inspector_agent.h"
++#include "node.h"
++#include "node_external_reference.h"
++#include "node_internals.h"
++#include "replayio.h"
++#include "util-inl.h"
++#include "v8-inspector.h"
++#include "v8.h"
++
++#include <memory>
++#include <string>
++
++static const char* AnnotationHookJSName = "recordreplay.annotationHook";
++
++extern "C" void V8RecordReplayOnAnnotation(const char* kind, const char* contents);
++
++namespace v8 {
++
++extern void FunctionCallbackIsRecordingOrReplaying(const FunctionCallbackInfo<Value>& args);
++extern void FunctionCallbackRecordReplayOnConsoleAPI(const FunctionCallbackInfo<Value>& args);
++extern void FunctionCallbackRecordReplaySetCommandCallback(const FunctionCallbackInfo<Value>& args);
++extern void FunctionCallbackRecordReplaySetClearPauseDataCallback(const FunctionCallbackInfo<Value>& callArgs);
++extern void FunctionCallbackRecordReplayIgnoreScript(const FunctionCallbackInfo<Value>& args);
++extern void FunctionCallbackRecordReplayAssert(const FunctionCallbackInfo<Value>& args);
++extern void FunctionCallbackRecordReplayGetCurrentError(const FunctionCallbackInfo<Value>& args);
++extern void FunctionCallbackRecordReplayGetRecordingId(const FunctionCallbackInfo<Value>& args);
++extern void FunctionCallbackRecordReplayCurrentExecutionPoint(const FunctionCallbackInfo<Value>& args);
++extern void FunctionCallbackRecordReplayElapsedTimeMs(const FunctionCallbackInfo<Value>& args);
++
++}
++
++namespace node {
++
++using v8::Context;
++using v8::FunctionCallbackInfo;
++using v8::Isolate;
++using v8::Local;
++using v8::NewStringType;
++using v8::Object;
++using v8::Value;
++
++namespace recordreplay {
++
++static bool AreEventsUnavailable() {
++  return v8::recordreplay::IsRecordingOrReplaying() &&
++         (v8::recordreplay::AreEventsDisallowed() ||
++          v8::recordreplay::HasDivergedFromRecording());
++}
++
++bool ThrowIfEventsUnavailable(Environment* env, const char* operation_name) {
++  if (!AreEventsUnavailable()) {
++    return false;
++  }
++  std::string message = std::string("Cannot replay operation ") +
++                         operation_name + " because it was not recorded.";
++  env->ThrowTypeError(message.c_str());
++  return true;
++}
++
++bool ThrowIfEventsUnavailable(const v8::FunctionCallbackInfo<v8::Value>& args,
++                              const char* operation_name) {
++  return ThrowIfEventsUnavailable(Environment::GetCurrent(args),
++                                  operation_name);
++}
++
++}  // namespace recordreplay
++
++namespace process {
++
++static void RecordReplayLog(const FunctionCallbackInfo<Value>& args) {
++  CHECK(args.Length() == 1 && args[0]->IsString() &&
++        "must be called with a single string");
++  Utf8Value text(args.GetIsolate(), args[0]);
++  v8::recordreplay::Print("%s", text.ToString().c_str());
++}
++
++static void RecordReplayAreEventsUnavailable(
++    const FunctionCallbackInfo<Value>& args) {
++  args.GetReturnValue().Set(recordreplay::AreEventsUnavailable());
++}
++
++// Function to invoke on CDP responses and events.
++static v8::Eternal<v8::Function>* gCDPMessageCallback;
++
++static void RecordReplaySetCDPMessageCallback(const FunctionCallbackInfo<Value>& args) {
++  CHECK(!gCDPMessageCallback);
++  Isolate* isolate = args.GetIsolate();
++  CHECK(args[0]->IsFunction());
++  Local<v8::Function> callback = args[0].As<v8::Function>();
++  gCDPMessageCallback = new v8::Eternal<v8::Function>(isolate, callback);
++}
++
++static std::unique_ptr<inspector::InspectorSession> gRecordReplayInspectorSession;
++
++class RecordReplaySessionDelegate : public inspector::InspectorSessionDelegate {
++ public:
++  void SendMessageToFrontend(const v8_inspector::StringView& message) override {
++    v8::replayio::AutoMarkReplayCode mark;
++    v8::replayio::AutoDisallowEvents disallow(
++        "RecordReplay_SendMessageToFrontend");
++    CHECK(v8::IsMainThread());
++
++    CHECK(gCDPMessageCallback);
++    CHECK(!message.is8Bit());
++
++    Isolate* isolate = v8::Isolate::GetCurrent();
++    v8::HandleScope scope(isolate);
++
++    Local<Context> context = isolate->GetCurrentContext();
++
++    Local<Value> arg = v8::String::NewFromTwoByte(isolate, message.characters16(),
++                                                  NewStringType::kNormal,
++                                                  message.length()).ToLocalChecked();
++    Local<v8::Function> callback = gCDPMessageCallback->Get(isolate);
++    v8::MaybeLocal<Value> rv = callback->Call(context, v8::Undefined(isolate), 1, &arg);
++    CHECK(!rv.IsEmpty());
++  }
++};
++
++static void RecordReplaySendCDPMessage(const FunctionCallbackInfo<Value>& args) {
++  CHECK(args.Length() == 1 && args[0]->IsString() &&
++        "must be called with a single string");
++  Utf8Value message(args.GetIsolate(), args[0]);
++
++  if (!gRecordReplayInspectorSession) {
++    Environment* env = Environment::GetCurrent(args);
++    inspector::Agent* agent = env->inspector_agent();
++
++    auto delegate = std::make_unique<RecordReplaySessionDelegate>();
++    {
++      v8::replayio::AutoMarkReplayCode mark;
++      v8::replayio::AutoDisallowEvents disallow(
++          "RecordReplaySendCDPMessage::Connect");
++      gRecordReplayInspectorSession = agent->Connect(std::move(delegate),
++                                                     /* prevent_shutdown */ false);
++    }
++    // process.exit() skips Environment destruction, so the process-owned Replay
++    // session would otherwise survive until static destruction, after V8's platform
++    // has been disposed. Reset it from AtExit, where Node normally waits for external
++    // debugger frontends to disconnect. This safely disables the debugger, which
++    // leaves WebAssembly modules tiered down (see V8Debugger::disable).
++    AtExit(env, [](void*) {
++      gRecordReplayInspectorSession.reset();
++    }, nullptr);
++  }
++
++  std::string nmessage(message.ToString());
++  v8_inspector::StringView messageView((const uint8_t*)nmessage.c_str(), nmessage.length());
++  {
++    v8::replayio::AutoMarkReplayCode mark;
++    v8::replayio::AutoDisallowEvents disallow("RecordReplaySendCDPMessage");
++    gRecordReplayInspectorSession->Dispatch(messageView);
++  }
++}
++
++// Called from javascript.
++// `recordreplay.annotationHook(kind, contents)`
++// Since this function is called from userland JS, we avoid assertions.
++// We don't want flawed uses of the API to crash the recording.
++static void RecordReplayAnnotationHook(
++    const FunctionCallbackInfo<Value>& args) {
++  if (!(args.Length() >= 2 && args[0]->IsString())) {
++    v8::recordreplay::Print("[RuntimeError] %s called with incorrect arguments",
++                            AnnotationHookJSName);
++    return;
++  }
++
++  v8::Isolate* isolate = args.GetIsolate();
++  v8::Local<v8::Object> payload = v8::Object::New(isolate);
++  v8::Local<v8::Context> context = isolate->GetCurrentContext();
++  payload->Set(context, v8::String::NewFromUtf8(isolate, "message").ToLocalChecked(), args[1]).Check();
++
++  v8::Local<v8::String> json;
++  if (!v8::JSON::Stringify(context, payload).ToLocal(&json)) {
++    v8::recordreplay::Print(
++        "[RuntimeError] %s contents failed to json stringify",
++        AnnotationHookJSName);
++    return;
++  }
++
++  v8::String::Utf8Value kind(args.GetIsolate(), args[0]);
++  v8::String::Utf8Value contents(args.GetIsolate(), json);
++  V8RecordReplayOnAnnotation(*kind, *contents);
++}
++
++}  // namespace process
++
++void InitializeRecordReplayMethods(Environment* env, Local<Object> target) {
++  env->SetMethod(target, "isRecordingOrReplaying",
++                 v8::FunctionCallbackIsRecordingOrReplaying);
++  env->SetMethod(target, "recordReplayLog", process::RecordReplayLog);
++  env->SetMethod(target,
++                 "recordReplayAreEventsUnavailable",
++                 process::RecordReplayAreEventsUnavailable);
++  env->SetMethod(target, "recordReplayOnConsoleAPI",
++                 v8::FunctionCallbackRecordReplayOnConsoleAPI);
++  env->SetMethod(target, "recordReplaySetCommandCallback",
++                 v8::FunctionCallbackRecordReplaySetCommandCallback);
++  env->SetMethod(target, "recordReplaySetClearPauseDataCallback",
++                 v8::FunctionCallbackRecordReplaySetClearPauseDataCallback);
++  env->SetMethod(target, "recordReplayIgnoreScript",
++                 v8::FunctionCallbackRecordReplayIgnoreScript);
++  env->SetMethod(target, "recordReplayAssert",
++                 v8::FunctionCallbackRecordReplayAssert);
++  env->SetMethod(target, "recordReplayGetCurrentError",
++                 v8::FunctionCallbackRecordReplayGetCurrentError);
++  env->SetMethod(target, "recordReplaySetCDPMessageCallback",
++                 process::RecordReplaySetCDPMessageCallback);
++  env->SetMethod(target, "recordReplaySendCDPMessage",
++                 process::RecordReplaySendCDPMessage);
++  env->SetMethod(target, "recordReplayRecordingId",
++                 v8::FunctionCallbackRecordReplayGetRecordingId);
++  env->SetMethod(target, "recordReplayCurrentExecutionPoint",
++                 v8::FunctionCallbackRecordReplayCurrentExecutionPoint);
++  env->SetMethod(target, "recordReplayElapsedTimeMs",
++                 v8::FunctionCallbackRecordReplayElapsedTimeMs);
++  env->SetMethod(
++      target, "recordReplayAnnotationHook", process::RecordReplayAnnotationHook);
++}
++
++void RegisterRecordReplayExternalReferences(
++    ExternalReferenceRegistry* registry) {
++  registry->Register(v8::FunctionCallbackIsRecordingOrReplaying);
++  registry->Register(process::RecordReplayLog);
++  registry->Register(process::RecordReplayAreEventsUnavailable);
++  registry->Register(v8::FunctionCallbackRecordReplayOnConsoleAPI);
++  registry->Register(v8::FunctionCallbackRecordReplaySetCommandCallback);
++  registry->Register(v8::FunctionCallbackRecordReplaySetClearPauseDataCallback);
++  registry->Register(v8::FunctionCallbackRecordReplayIgnoreScript);
++  registry->Register(v8::FunctionCallbackRecordReplayAssert);
++  registry->Register(v8::FunctionCallbackRecordReplayGetCurrentError);
++  registry->Register(process::RecordReplaySetCDPMessageCallback);
++  registry->Register(process::RecordReplaySendCDPMessage);
++  registry->Register(v8::FunctionCallbackRecordReplayGetRecordingId);
++  registry->Register(v8::FunctionCallbackRecordReplayCurrentExecutionPoint);
++  registry->Register(v8::FunctionCallbackRecordReplayElapsedTimeMs);
++  registry->Register(process::RecordReplayAnnotationHook);
++}
++
++}  // namespace node

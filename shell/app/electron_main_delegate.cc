@@ -72,6 +72,10 @@
 #include "shell/common/crash_keys.h"
 #endif
 
+#if BUILDFLAG(IS_MAC)
+extern "C" void* ReplayDriverHandle();
+#endif
+
 namespace electron {
 
 namespace {
@@ -264,6 +268,19 @@ absl::optional<int> ElectronMainDelegate::BasicStartupComplete() {
 
   if (env->HasVar(kElectronDisableSandbox))
     command_line->AppendSwitch(sandbox::policy::switches::kNoSandbox);
+
+#if BUILDFLAG(IS_MAC)
+  // What recording a browser process or its renderers requires, as in
+  // chrome/app/record_replay_main.cc: a sandboxed renderer can't write its
+  // recording, and what a GPU process writes to memory it shares with others
+  // isn't in anyone's recording. A window which asks for the sandbox still
+  // gets a renderer with no Node in it, as --enable-sandbox decides that.
+  if (IsBrowserProcess(command_line) &&
+      (ReplayDriverHandle() || env->HasVar("RECORD_ALL_CONTENT"))) {
+    command_line->AppendSwitch(sandbox::policy::switches::kNoSandbox);
+    command_line->AppendSwitch(::switches::kDisableGpu);
+  }
+#endif
 
   tracing_sampler_profiler_ =
       tracing::TracingSamplerProfiler::CreateOnMainThread();

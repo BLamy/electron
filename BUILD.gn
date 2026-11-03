@@ -805,6 +805,23 @@ if (is_mac) {
     outputs = [ "$root_out_dir/fake/$v8_context_snapshot_filename" ]
   }
 
+  declare_args() {
+    # The end of this runtime's Replay build IDs: <date>-<runtime rev>-<driver rev>.
+    # The engine replays a recording with the build whose ID it holds.
+    replay_build_id_suffix = "00000000-000000000000-000000000000"
+  }
+
+  # Attaches Replay's driver before the framework's static initializers.
+  shared_library("replay_attach") {
+    output_name = "ReplayAttach"
+    sources = [ "shell/app/replay_attach_mac.c" ]
+    defines = [
+      "REPLAY_BUILD_ID=\"macOS-electron-$replay_build_id_suffix\"",
+      "REPLAY_RENDERER_BUILD_ID=\"macOS-electronrenderer-$replay_build_id_suffix\"",
+    ]
+    ldflags = [ "-Wl,-install_name,@rpath/libReplayAttach.dylib" ]
+  }
+
   bundle_data("electron_framework_resources") {
     public_deps = [ ":packed_resources" ]
     sources = []
@@ -833,8 +850,14 @@ if (is_mac) {
     bundle_data("electron_framework_libraries") {
       sources = []
       public_deps = []
-      sources += [ "$root_out_dir/libffmpeg.dylib" ]
-      public_deps += [ "//third_party/ffmpeg:ffmpeg" ]
+      sources += [
+        "$root_out_dir/libReplayAttach.dylib",
+        "$root_out_dir/libffmpeg.dylib",
+      ]
+      public_deps += [
+        ":replay_attach",
+        "//third_party/ffmpeg:ffmpeg",
+      ]
       outputs = [ "{{bundle_contents_dir}}/Libraries/{{source_file_part}}" ]
     }
   } else {

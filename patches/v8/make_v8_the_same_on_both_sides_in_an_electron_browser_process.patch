@@ -1,0 +1,963 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Brett Lamy <blamy@Bretts-MacBook-Pro.local>
+Date: Tue, 3 Nov 2026 03:02:55 -0500
+Subject: Make V8 the same on both sides in an Electron browser process
+
+An Electron browser process has none of the annotations a renderer has. The
+driver runs its recorded threads one at a time and keeps its heap at the same
+addresses on both sides. So when its driver says so, V8 does the same thing on
+both sides too, which a renderer's doesn't: the same bytecode, instrumentation
+opcodes included, the same flags, and a GC which isn't hidden from the
+recording, so that it happens at the same points and so do its weak callbacks.
+
+Also what Node's bindings need, from the copy of V8 in Replay's Node, and hiding
+the scripts Node and Electron run for themselves.
+
+diff --git a/include/replayio.h b/include/replayio.h
+index db681621110a9bfe66ba09f54cae714059e6dba1..9d9ae10fead71b8f75fa99ed6b6d4e777f05b298 100644
+--- a/include/replayio.h
++++ b/include/replayio.h
+@@ -25,6 +25,32 @@ struct AutoDisallowEvents {
+   ~AutoDisallowEvents() { v8::recordreplay::EndDisallowEvents(); }
+ };
+ 
++// For code which runs at points which differ between recording and replaying,
++// such as the GC. See recordreplay::IsSameOnBothSides.
++struct AutoDisallowNondeterministicEvents {
++  explicit AutoDisallowNondeterministicEvents(const char* label)
++      : active_(v8::recordreplay::ShouldDisallowNondeterministicEvents()) {
++    if (active_) v8::recordreplay::BeginDisallowEventsWithLabel(label);
++  }
++  ~AutoDisallowNondeterministicEvents() {
++    if (active_) v8::recordreplay::EndDisallowEvents();
++  }
++
++  AutoDisallowNondeterministicEvents(const AutoDisallowNondeterministicEvents&) = delete;
++  AutoDisallowNondeterministicEvents& operator=(const AutoDisallowNondeterministicEvents&) = delete;
++
++ private:
++  bool active_;
++};
++
++struct AutoMarkReplayCode {
++  AutoMarkReplayCode() { v8::recordreplay::EnterReplayCode(); }
++  ~AutoMarkReplayCode() { v8::recordreplay::ExitReplayCode(); }
++
++  AutoMarkReplayCode(const AutoMarkReplayCode&) = delete;
++  AutoMarkReplayCode& operator=(const AutoMarkReplayCode&) = delete;
++};
++
+ }  // namespace replayio
+ }  // namespace v8
+ 
+diff --git a/include/v8.h b/include/v8.h
+index b2575a7311401f8162ff3362a55c88e57c8fda5b..2cdcad4c61057112a347239d11eadd4ecf0f4790 100644
+--- a/include/v8.h
++++ b/include/v8.h
+@@ -146,6 +146,22 @@ static bool AreEventsDisallowed(const char* why = nullptr);
+ // resulting from this check.
+ static bool IsInReplayCode(const char* why = nullptr);
+ 
++// An Electron browser process has none of the annotations a renderer has. The
++// driver runs its recorded threads one at a time and keeps its heap at the same
++// addresses on both sides (see the driver's ObjCBridge.h). So it needs V8 to do
++// exactly the same thing on both sides, which a renderer doesn't: the same
++// bytecode, the same flags, and a GC which isn't hidden from the recording, so
++// that it happens at the same points and so do its weak callbacks.
++static bool IsSameOnBothSides();
++
++// Whether a region of code which doesn't run at the same points on each side
++// has to disallow events. Not when this process is the same on both sides,
++// unless it's running code of ours, or has diverged at a pause.
++static bool ShouldDisallowNondeterministicEvents();
++
++static void EnterReplayCode();
++static void ExitReplayCode();
++
+ static bool HasDivergedFromRecording();
+ static bool AllowSideEffects();
+ 
+diff --git a/src/api/api.cc b/src/api/api.cc
+index 4cd7eea438d049aee7f4dae0dc945ddfe45f99cb..a9ccc095b986adbd1def89f9e5d7ed26ae3f2c0e 100644
+--- a/src/api/api.cc
++++ b/src/api/api.cc
+@@ -10795,6 +10795,8 @@ typedef char* (CommandCallbackRaw)(const char* params);
+   Macro(RecordReplayAreEventsPassedThrough, (), bool, false)                  \
+   Macro(RecordReplayAreAssertsDisabled, (), bool, false)                      \
+   Macro(RecordReplayCreateOrderedLock, (const char* name), size_t, 0)         \
++  Macro(RecordReplayCurrentExecutionPoint, (), char*, nullptr)                \
++  Macro(RecordReplayElapsedTimeMs, (), size_t, 0)                             \
+   Macro(RecordReplayIsReplaying, (), bool, false)                             \
+   Macro(RecordReplayHasDivergedFromRecording, (), bool, false)                \
+   Macro(RecordReplayNewDependencyGraphNode, (const char* json), int, 0)       \
+@@ -10867,6 +10869,8 @@ typedef char* (CommandCallbackRaw)(const char* params);
+   Macro(RecordReplayAddMetadata, (const char* metadata))                      \
+   Macro(RecordReplayJSONFree, (void*))                                        \
+   Macro(RecordReplayOnAnnotation, (const char* kind, const char* contents))   \
++  Macro(RecordReplayNewCheckpointFlushed, ())                                 \
++  Macro(RecordReplayFree, (void* ptr))                                        \
+   Macro(RecordReplayAddPossibleBreakpoint,                                    \
+         (int line, int column, const char* function_id, int function_index))  \
+   Macro(RecordReplayOnEvent, (const char* aEvent, bool aBefore))              \
+@@ -12231,6 +12235,14 @@ bool IsMainThread() {
+ }
+ #endif
+ 
++static bool gSameOnBothSides;
++
++// The driver for a process which runs its recorded threads one at a time exports this.
++static bool RecordReplayDriverIsSameOnBothSides(void* handle) {
++  void* sym = dlsym(handle, "RecordReplayIsSameOnBothSides");
++  return sym && reinterpret_cast<bool (*)()>(sym)();
++}
++
+ // Set this process as recording or replaying.
+ // Also serves to initializes Replay state.
+ void recordreplay::SetRecordingOrReplaying(void* handle) {
+@@ -12249,6 +12261,7 @@ ForEachRecordReplaySymbolVoid(LoadRecordReplaySymbolVoid)
+ 
+   gRecordingOrReplaying = V8RecordReplayFeatureEnabled("record-replay", nullptr);
+   InitMainThread();
++  gSameOnBothSides = RecordReplayDriverIsSameOnBothSides(handle);
+ 
+   gAssertsDisabled = gRecordReplayAreAssertsDisabled();
+ 
+@@ -12292,7 +12305,7 @@ ForEachRecordReplaySymbolVoid(LoadRecordReplaySymbolVoid)
+ 
+   // Currently the dependency graph is enabled by default.
+   i::gRecordReplayEnableDependencyGraph =
+-    V8RecordReplayFeatureEnabled("dependency-graph", nullptr);
++    !gSameOnBothSides && V8RecordReplayFeatureEnabled("dependency-graph", nullptr);
+ 
+   i::gRecordReplayAssertDependencyGraph = !!getenv("RECORD_REPLAY_DEPENDENCY_GRAPH_ASSERTS");
+ 
+@@ -12313,7 +12326,8 @@ ForEachRecordReplaySymbolVoid(LoadRecordReplaySymbolVoid)
+   }
+ 
+   // Disable some GC settings while replaying for causing mysterious crashes.
+-  if (IsReplaying() || !V8RecordReplayFeatureEnabled("v8-flags-gc", nullptr)) {
++  if (IsReplaying() || gSameOnBothSides ||
++      !V8RecordReplayFeatureEnabled("v8-flags-gc", nullptr)) {
+     i::FLAG_concurrent_marking = false;
+     i::FLAG_concurrent_sweeping = false;
+     i::FLAG_incremental_marking_task = false;
+@@ -12326,10 +12340,20 @@ ForEachRecordReplaySymbolVoid(LoadRecordReplaySymbolVoid)
+   }
+ 
+   // For now the compilation cache is only used when recording.
+-  if (IsReplaying() || !V8RecordReplayFeatureEnabled("v8-flags-compilation-cache", nullptr)) {
++  if (IsReplaying() || gSameOnBothSides ||
++      !V8RecordReplayFeatureEnabled("v8-flags-compilation-cache", nullptr)) {
+     i::FLAG_compilation_cache = false;
+   }
+ 
++  // Interpreted, and with nothing happening in the background. This is what
++  // makes the JS heap the same on both sides, and it's also a single process's
++  // main thread, which spends most of its time waiting.
++  if (gSameOnBothSides) {
++    i::v8_flags.single_threaded = true;
++    i::v8_flags.turbofan = false;
++    i::v8_flags.sparkplug = false;
++  }
++
+   // Write out our pid to a file if specified.
+   char* env = getenv("RECORD_REPLAY_PID_FILE");
+   if (env) {
+@@ -12379,6 +12403,48 @@ extern "C" DLLEXPORT void V8RecordReplayExitReplayCode() {
+   gInReplayCode--;
+ }
+ 
++bool recordreplay::IsSameOnBothSides() {
++  return gSameOnBothSides;
++}
++
++extern "C" DLLEXPORT bool V8RecordReplayIsSameOnBothSides() {
++  return gSameOnBothSides;
++}
++
++bool recordreplay::ShouldDisallowNondeterministicEvents() {
++  return !gSameOnBothSides || (IsMainThread() && gInReplayCode) ||
++         HasDivergedFromRecording();
++}
++
++void recordreplay::EnterReplayCode() {
++  V8RecordReplayEnterReplayCode();
++}
++
++void recordreplay::ExitReplayCode() {
++  V8RecordReplayExitReplayCode();
++}
++
++std::string RecordReplayGetCurrentExecutionPoint() {
++  CHECK(recordreplay::IsRecordingOrReplaying());
++  CHECK(IsMainThread());
++  char* point = gRecordReplayCurrentExecutionPoint();
++  std::string rv = point;
++  gRecordReplayFree(point);
++  return rv;
++}
++
++void RecordReplayNewCheckpointFlushed() {
++  if (recordreplay::IsRecordingOrReplaying()) {
++    gRecordReplayNewCheckpointFlushed();
++  }
++}
++
++size_t RecordReplayElapsedTimeMs() {
++  CHECK(recordreplay::IsRecordingOrReplaying());
++  return gRecordReplayElapsedTimeMs();
++}
++
++
+ 
+ extern "C" DLLEXPORT void V8RecordReplayBeginAssertBufferAllocations(const char* issueLabel) {
+   if (!recordreplay::IsRecordingOrReplaying() || recordreplay::AreAssertsDisabled()) {
+diff --git a/src/ast/scopes.cc b/src/ast/scopes.cc
+index a2565185963a11b16e4167184490dff0a493939f..28055c4dbe8cf3f3a72ea93a64ca3dd708672f5b 100644
+--- a/src/ast/scopes.cc
++++ b/src/ast/scopes.cc
+@@ -1045,7 +1045,7 @@ Variable* DeclarationScope::DeclareParameter(const AstRawString* name,
+   // Ideally we'd only do this for non-leaf functions, but it's not
+   // immediately obvious how to do that at this level.
+   // (RUN-2604)
+-  if (recordreplay::IsReplaying() &&
++  if ((recordreplay::IsReplaying() || recordreplay::IsSameOnBothSides()) &&
+       recordreplay::FeatureEnabled("force-variable-context-allocation")) {
+     var->ForceContextAllocation();
+   }
+@@ -1182,7 +1182,7 @@ Variable* Scope::DeclareVariable(
+   // Ideally we'd only do this for non-leaf functions, but it's not
+   // immediately obvious how to do that at this level.
+   // (RUN-2604)
+-  if (recordreplay::IsReplaying() &&
++  if ((recordreplay::IsReplaying() || recordreplay::IsSameOnBothSides()) &&
+       recordreplay::FeatureEnabled("force-variable-context-allocation") &&
+       kind == VariableKind::NORMAL_VARIABLE) {
+         var->ForceContextAllocation();
+diff --git a/src/codegen/compiler.cc b/src/codegen/compiler.cc
+index dd7473e73c88b1b5237934f2c08d110a8b8b8ee1..9818efe2eda8a57fc7a7e9a7cd9f90dd9b54d4ed 100644
+--- a/src/codegen/compiler.cc
++++ b/src/codegen/compiler.cc
+@@ -1607,6 +1607,7 @@ BackgroundCompileTask::BackgroundCompileTask(
+ 
+ extern bool RecordReplayHasDefaultContext();
+ extern bool RecordReplayAssertValues(const std::string& url);
++extern bool RecordReplayIgnoreScriptByURL(const char* url);
+ 
+ static void SetRecordReplayFlags(UnoptimizedCompileFlags& flags, const std::string& url) {
+   if (!recordreplay::IsRecordingOrReplaying()) {
+@@ -1616,7 +1617,8 @@ static void SetRecordReplayFlags(UnoptimizedCompileFlags& flags, const std::stri
+   if (!IsMainThread() ||
+       !RecordReplayHasDefaultContext() ||
+       recordreplay::AreEventsDisallowed("CompileFlags") ||
+-      recordreplay::IsInReplayCode("CompileFlags")) {
++      recordreplay::IsInReplayCode("CompileFlags") ||
++      RecordReplayIgnoreScriptByURL(url.c_str())) {
+     flags.set_record_replay_ignore(true);
+     return;
+   }
+@@ -2775,7 +2777,7 @@ void Compiler::CompileOptimized(Isolate* isolate, Handle<JSFunction> function,
+                                 ConcurrencyMode mode, CodeKind code_kind) {
+   // The point at which optimized compilations occur can vary between recording
+   // and replaying.
+-  replayio::AutoDisallowEvents disallow("Compiler::CompileOptimized");
++  replayio::AutoDisallowNondeterministicEvents disallow("Compiler::CompileOptimized");
+ 
+   DCHECK(CodeKindIsOptimizedJSFunction(code_kind));
+   DCHECK(AllowCompilation::IsAllowed(isolate));
+@@ -4029,7 +4031,7 @@ MaybeHandle<CodeT> Compiler::CompileOptimizedOSR(Isolate* isolate,
+                                                  ConcurrencyMode mode) {
+   // The point at which optimized compilations occur can vary between recording
+   // and replaying.
+-  replayio::AutoDisallowEvents disallow("Compiler::CompileOptimizedOSR");
++  replayio::AutoDisallowNondeterministicEvents disallow("Compiler::CompileOptimizedOSR");
+ 
+   DCHECK(IsOSR(osr_offset));
+ 
+diff --git a/src/compiler/backend/code-generator.cc b/src/compiler/backend/code-generator.cc
+index 84594ace6e6f66287dd012ceafd6eebeaa746929..c5a3faaf445fceb6048ff59573b666caaa480198 100644
+--- a/src/compiler/backend/code-generator.cc
++++ b/src/compiler/backend/code-generator.cc
+@@ -468,7 +468,7 @@ base::OwnedVector<byte> CodeGenerator::GetProtectedInstructionsData() {
+ }
+ 
+ MaybeHandle<Code> CodeGenerator::FinalizeCode() {
+-  replayio::AutoDisallowEvents disallow("CodeGenerator::FinalizeCode");
++  replayio::AutoDisallowNondeterministicEvents disallow("CodeGenerator::FinalizeCode");
+ 
+   if (result_ != kSuccess) {
+     tasm()->AbortedCodeGeneration();
+diff --git a/src/debug/debug.cc b/src/debug/debug.cc
+index 8781eb2efaec1f71c864b8b3d9291fd3500f7f91..ce92d1ac0fa2a9c9372e51f35551e18a1e2cdb1a 100644
+--- a/src/debug/debug.cc
++++ b/src/debug/debug.cc
+@@ -9,6 +9,7 @@
+ 
+ #include "src/api/api-inl.h"
+ #include "src/base/platform/mutex.h"
++#include "src/tasks/task-utils.h"
+ #include "src/builtins/builtins.h"
+ #include "src/codegen/compilation-cache.h"
+ #include "src/codegen/compiler.h"
+@@ -3694,6 +3695,14 @@ bool RecordReplayIsInternalScriptURL(const char* url) {
+ 
+ extern bool RecordReplayHasDefaultContext();
+ 
++// Scripts which are part of the runtime rather than the application: V8's, and
++// what Node and Electron run for themselves. They get no instrumentation or
++// sources, and aren't on the stack as far as the debugger's concerned.
++bool RecordReplayIgnoreScriptByURL(const char* url) {
++  return !strcmp(url, "v8/externalize") || !strcmp(url, "v8/gc") ||
++         !strncmp(url, "node:", 5) || !strncmp(url, "electron/js2c/", 14);
++}
++
+ typedef std::unordered_set<int> ScriptIdSet;
+ static ScriptIdSet* gRegisteredScripts;
+ 
+@@ -3712,6 +3721,13 @@ bool RecordReplayIsDivergentUserJSWithoutPause(
+              Script::cast(shared.script()));
+ }
+ 
++// Whether a script's hidden from the frames the debugger reports. Scripts which
++// weren't registered are ones which ran in code of ours, such as evaluations.
++bool RecordReplayIgnoreScriptById(Isolate* isolate, int script_id) {
++  Handle<Script> script = GetScript(isolate, script_id);
++  return !RecordReplayHasRegisteredScript(*script);
++}
++
+ typedef std::vector<std::pair<Eternal<Value>*, bool>> NewScriptHandlerVector;
+ static NewScriptHandlerVector* gNewScriptHandlers;
+ 
+@@ -3769,6 +3785,15 @@ static void RecordReplayRegisterScript(Handle<Script> script) {
+     url = name.get();
+   }
+ 
++  if (RecordReplayIgnoreScriptByURL(url.c_str())) {
++    return;
++  }
++
++  // A browser process's scripts are named by their paths, as Node's are.
++  if (recordreplay::IsSameOnBothSides() && url[0] == '/') {
++    url = "file://" + url;
++  }
++
+   if (!strcmp(url.c_str(), "record-replay-internal")) {
+     // [TT-1390] Hackfix to not register the sourcemap handling script.
+     // We will have a better fix in the upcoming patch for TT-1112.
+@@ -4397,4 +4422,165 @@ void FunctionCallbackRecordReplayGetScriptSource(const FunctionCallbackInfo<Valu
+   callArgs.GetReturnValue().Set(source_val);
+ }
+ 
++// What Node's bindings use, from the copy of V8 in Replay's Node.
++
++extern "C" void V8RecordReplayOnConsoleMessage(size_t bookmark);
++
++extern std::string RecordReplayGetCurrentExecutionPoint();
++extern void RecordReplayNewCheckpointFlushed();
++extern size_t RecordReplayElapsedTimeMs();
++
++// When CurrentExecutionPoint has been used there isn't a guarantee that the point
++// can be visited until we call NewCheckpointFlushed(). Ensure there is a timer
++// running that makes sure this will be called soon if this API has been used.
++static bool gHasNewCheckpointFlushedTask = false;
++
++// How long to wait before ensuring the recording is flushed after getting the
++// current execution point.
++static double NewCheckpointFlushedDelaySeconds = 5.0;
++
++void FunctionCallbackIsRecordingOrReplaying(const FunctionCallbackInfo<Value>& callArgs) {
++  Local<Boolean> rv = Boolean::New(callArgs.GetIsolate(), recordreplay::IsRecordingOrReplaying());
++  callArgs.GetReturnValue().Set(rv);
++}
++
++void FunctionCallbackRecordReplayOnConsoleAPI(const FunctionCallbackInfo<Value>& callArgs) {
++  CHECK(recordreplay::IsRecordingOrReplaying());
++  if (IsMainThread()) {
++    V8RecordReplayOnConsoleMessage(0);
++  }
++}
++
++void FunctionCallbackRecordReplayIgnoreScript(const FunctionCallbackInfo<Value>& callArgs) {
++  CHECK(recordreplay::IsRecordingOrReplaying());
++  CHECK(IsMainThread());
++
++  Isolate* isolate = callArgs.GetIsolate();
++
++  i::Handle<i::Object> base = Utils::OpenHandle(*callArgs[0]);
++  std::unique_ptr<char[]> name = i::String::cast(*base).ToCString();
++  int script_id = atoi(name.get());
++
++  bool ignore = i::RecordReplayIgnoreScriptById((i::Isolate*)isolate, script_id);
++
++  Local<Boolean> rv = Boolean::New(isolate, ignore);
++  callArgs.GetReturnValue().Set(rv);
++}
++
++void FunctionCallbackRecordReplayAssert(const FunctionCallbackInfo<Value>& callArgs) {
++  if (!recordreplay::IsRecordingOrReplaying()) {
++    return;
++  }
++
++  i::Handle<i::Object> value = Utils::OpenHandle(*callArgs[0]);
++
++  // This is used when a script explicitly asserts the contents of a value, so we can do
++  // more thorough checking.
++  if (value->IsString()) {
++    std::unique_ptr<char[]> contents = i::String::cast(*value).ToCString();
++    size_t len = strlen(contents.get());
++    if (len < 2000) {
++      recordreplay::Assert("AssertValue StringContents %s", contents.get());
++    } else {
++      recordreplay::AssertBytes("AssertValue StringBytes", contents.get(), len);
++    }
++  } else {
++    std::string contents = i::RecordReplayBasicValueContents(value);
++    recordreplay::Assert("AssertValue %s", contents.c_str());
++  }
++}
++
++static i::Handle<i::JSMessageObject>* gCurrentErrorEvent;
++
++extern "C" void V8RecordReplayOnErrorEvent(v8::Local<v8::Message> message) {
++  if (!recordreplay::IsRecordingOrReplaying()) {
++    return;
++  }
++
++  auto self = Utils::OpenHandle(*message);
++
++  gCurrentErrorEvent = &self;
++  V8RecordReplayOnConsoleMessage(self->record_replay_bookmark());
++  gCurrentErrorEvent = nullptr;
++}
++
++void FunctionCallbackRecordReplayGetCurrentError(const FunctionCallbackInfo<Value>& args) {
++  if (!gCurrentErrorEvent) {
++    return;
++  }
++
++  i::Isolate* isolate = (i::Isolate*) args.GetIsolate();
++  i::Handle<i::Object> rv = i::NewPlainObject(isolate);
++
++  auto msg = *gCurrentErrorEvent;
++  i::Handle<i::String> message = i::MessageHandler::GetMessage(isolate, msg);
++  i::Handle<i::Script> script(msg->script(), isolate);
++
++  std::string url;
++  if (!script->name().IsUndefined()) {
++    std::unique_ptr<char[]> name = i::String::cast(script->name()).ToCString();
++    url = std::string("file://") + name.get();
++  }
++
++  i::JSMessageObject::EnsureSourcePositionsAvailable(isolate, msg);
++
++  i::SetProperty(isolate, rv, "message", message);
++  i::SetProperty(isolate, rv, "filename", url.c_str());
++  i::SetProperty(isolate, rv, "line", msg->GetLineNumber());
++  i::SetProperty(isolate, rv, "column", msg->GetColumnNumber());
++  i::SetProperty(isolate, rv, "scriptId", GetProtocolSourceId(isolate, script));
++
++  args.GetReturnValue().Set(Utils::ToLocal(rv));
++}
++
++void FunctionCallbackRecordReplayGetRecordingId(const FunctionCallbackInfo<Value>& args) {
++  if (!recordreplay::IsRecordingOrReplaying()) {
++    return;
++  }
++
++  i::Isolate* isolate = (i::Isolate*) args.GetIsolate();
++
++  const char* recordingId = recordreplay::GetRecordingId();
++  if (!recordingId) {
++    return;
++  }
++  i::Handle<i::String> rv = CStringToHandle(isolate, recordingId);
++  args.GetReturnValue().Set(Utils::ToLocal(rv));
++}
++
++void FunctionCallbackRecordReplayCurrentExecutionPoint(const FunctionCallbackInfo<Value>& args) {
++  if (!recordreplay::IsRecordingOrReplaying() || !IsMainThread()) {
++    return;
++  }
++
++  i::Isolate* isolate = (i::Isolate*) args.GetIsolate();
++
++  std::string point = RecordReplayGetCurrentExecutionPoint();
++  i::Handle<i::String> rv = CStringToHandle(isolate, point.c_str());
++  args.GetReturnValue().Set(Utils::ToLocal(rv));
++
++  if (!gHasNewCheckpointFlushedTask) {
++    gHasNewCheckpointFlushedTask = true;
++
++    auto task_runner = i::V8::GetCurrentPlatform()->GetForegroundTaskRunner(args.GetIsolate());
++    auto task = i::MakeCancelableTask(isolate, []() {
++      RecordReplayNewCheckpointFlushed();
++      gHasNewCheckpointFlushedTask = false;
++    });
++    task_runner->PostDelayedTask(std::move(task), NewCheckpointFlushedDelaySeconds);
++  }
++}
++
++void FunctionCallbackRecordReplayElapsedTimeMs(const FunctionCallbackInfo<Value>& args) {
++  if (!recordreplay::IsRecordingOrReplaying()) {
++    return;
++  }
++
++  Isolate* isolate = args.GetIsolate();
++
++  size_t elapsed = RecordReplayElapsedTimeMs();
++  Local<Value> elapsed_value = v8::Integer::New(isolate, static_cast<int32_t>(elapsed));
++  args.GetReturnValue().Set(elapsed_value);
++}
++
+ }  // namespace v8
+diff --git a/src/execution/futex-emulation.cc b/src/execution/futex-emulation.cc
+index fb22b4ed70825c723b98e19cc3cc50ab0c9d2979..6062b713e1153d7fa84961ebccf737a023872072 100644
+--- a/src/execution/futex-emulation.cc
++++ b/src/execution/futex-emulation.cc
+@@ -126,7 +126,7 @@ bool FutexWaitListNode::CancelTimeoutTask() {
+ void FutexWaitListNode::NotifyWake() {
+   DCHECK(!IsAsync());
+ 
+-  replayio::AutoDisallowEvents disallow("FutexWaitListNode::NotifyWake");
++  replayio::AutoDisallowNondeterministicEvents disallow("FutexWaitListNode::NotifyWake");
+ 
+   // Lock the FutexEmulation mutex before notifying. We know that the mutex
+   // will have been unlocked if we are currently waiting on the condition
+@@ -250,7 +250,7 @@ void AtomicsWaitWakeHandle::Wake() {
+   // The split lock by itself isn’t an issue, as long as the caller properly
+   // synchronizes this with the closing `AtomicsWaitCallback`.
+   {
+-    replayio::AutoDisallowEvents disallow("AtomicsWaitWakeHandle::Wake");
++    replayio::AutoDisallowNondeterministicEvents disallow("AtomicsWaitWakeHandle::Wake");
+     NoGarbageCollectionMutexGuard lock_guard(g_mutex.Pointer());
+     stopped_ = true;
+   }
+@@ -388,7 +388,7 @@ Object FutexEmulation::WaitSync(Isolate* isolate,
+   AtomicsWaitEvent callback_result = AtomicsWaitEvent::kWokenUp;
+ 
+   do {  // Not really a loop, just makes it easier to break out early.
+-    replayio::AutoDisallowEvents disallow("FutexEmulation::WaitSync");
++    replayio::AutoDisallowNondeterministicEvents disallow("FutexEmulation::WaitSync");
+     NoGarbageCollectionMutexGuard lock_guard(g_mutex.Pointer());
+ 
+     std::shared_ptr<BackingStore> backing_store =
+@@ -551,7 +551,7 @@ Object FutexEmulation::WaitAsync(Isolate* isolate,
+   enum class ResultKind { kNotEqual, kTimedOut, kAsync };
+   ResultKind result_kind;
+   {
+-    replayio::AutoDisallowEvents disallow("FutexEmulation::WaitAsync");
++    replayio::AutoDisallowNondeterministicEvents disallow("FutexEmulation::WaitAsync");
+     // 16. Perform EnterCriticalSection(WL).
+     NoGarbageCollectionMutexGuard lock_guard(g_mutex.Pointer());
+ 
+@@ -668,7 +668,7 @@ Object FutexEmulation::Wake(Handle<JSArrayBuffer> array_buffer, size_t addr,
+   std::shared_ptr<BackingStore> backing_store = array_buffer->GetBackingStore();
+   auto wait_location = FutexWaitList::ToWaitLocation(backing_store.get(), addr);
+ 
+-  replayio::AutoDisallowEvents disallow("FutexEmulation::Wake");
++  replayio::AutoDisallowNondeterministicEvents disallow("FutexEmulation::Wake");
+   NoGarbageCollectionMutexGuard lock_guard(g_mutex.Pointer());
+ 
+   auto& location_lists = g_wait_list.Pointer()->location_lists_;
+@@ -830,7 +830,7 @@ void FutexEmulation::ResolveAsyncWaiterPromises(Isolate* isolate) {
+ 
+   FutexWaitListNode* node;
+   {
+-    replayio::AutoDisallowEvents disallow("FutexEmulation::ResolveAsyncWaiterPromises");
++    replayio::AutoDisallowNondeterministicEvents disallow("FutexEmulation::ResolveAsyncWaiterPromises");
+     NoGarbageCollectionMutexGuard lock_guard(g_mutex.Pointer());
+ 
+     auto& isolate_map = g_wait_list.Pointer()->isolate_promises_to_resolve_;
+@@ -864,7 +864,7 @@ void FutexEmulation::HandleAsyncWaiterTimeout(FutexWaitListNode* node) {
+   DCHECK(node->IsAsync());
+ 
+   {
+-    replayio::AutoDisallowEvents disallow("FutexEmulation::HandleAsyncWaiterTimeout");
++    replayio::AutoDisallowNondeterministicEvents disallow("FutexEmulation::HandleAsyncWaiterTimeout");
+     NoGarbageCollectionMutexGuard lock_guard(g_mutex.Pointer());
+ 
+     node->timeout_task_id_ = CancelableTaskManager::kInvalidTaskId;
+@@ -886,7 +886,7 @@ void FutexEmulation::HandleAsyncWaiterTimeout(FutexWaitListNode* node) {
+ }
+ 
+ void FutexEmulation::IsolateDeinit(Isolate* isolate) {
+-  replayio::AutoDisallowEvents disallow("FutexEmulation::IsolateDeinit");
++  replayio::AutoDisallowNondeterministicEvents disallow("FutexEmulation::IsolateDeinit");
+   NoGarbageCollectionMutexGuard lock_guard(g_mutex.Pointer());
+ 
+   // Iterate all locations to find nodes belonging to "isolate" and delete them.
+@@ -932,7 +932,7 @@ Object FutexEmulation::NumWaitersForTesting(Handle<JSArrayBuffer> array_buffer,
+   DCHECK_LT(addr, array_buffer->GetByteLength());
+   std::shared_ptr<BackingStore> backing_store = array_buffer->GetBackingStore();
+ 
+-  replayio::AutoDisallowEvents disallow("FutexEmulation::NumWaitersForTesting");
++  replayio::AutoDisallowNondeterministicEvents disallow("FutexEmulation::NumWaitersForTesting");
+   NoGarbageCollectionMutexGuard lock_guard(g_mutex.Pointer());
+ 
+   auto wait_location = FutexWaitList::ToWaitLocation(backing_store.get(), addr);
+@@ -957,7 +957,7 @@ Object FutexEmulation::NumWaitersForTesting(Handle<JSArrayBuffer> array_buffer,
+ }
+ 
+ Object FutexEmulation::NumAsyncWaitersForTesting(Isolate* isolate) {
+-  replayio::AutoDisallowEvents disallow("FutexEmulation::NumAsyncWaitersForTesting");
++  replayio::AutoDisallowNondeterministicEvents disallow("FutexEmulation::NumAsyncWaitersForTesting");
+   NoGarbageCollectionMutexGuard lock_guard(g_mutex.Pointer());
+ 
+   int waiters = 0;
+@@ -979,7 +979,7 @@ Object FutexEmulation::NumUnresolvedAsyncPromisesForTesting(
+   DCHECK_LT(addr, array_buffer->GetByteLength());
+   std::shared_ptr<BackingStore> backing_store = array_buffer->GetBackingStore();
+ 
+-  replayio::AutoDisallowEvents disallow("FutexEmulation::NumUnresolvedAsyncPromisesForTesting");
++  replayio::AutoDisallowNondeterministicEvents disallow("FutexEmulation::NumUnresolvedAsyncPromisesForTesting");
+   NoGarbageCollectionMutexGuard lock_guard(g_mutex.Pointer());
+ 
+   int waiters = 0;
+diff --git a/src/heap/allocation-observer.cc b/src/heap/allocation-observer.cc
+index e8e2d9daea5ded862d3ad6aca9e6ff2098971e84..e0a5d31b3629b1f87fe84a291ee4de8847f57215 100644
+--- a/src/heap/allocation-observer.cc
++++ b/src/heap/allocation-observer.cc
+@@ -87,7 +87,7 @@ void AllocationCounter::InvokeAllocationObservers(Address soon_object,
+     return;
+   }
+ 
+-  replayio::AutoDisallowEvents disallow("AllocationCounter::InvokeAllocationObservers");
++  replayio::AutoDisallowNondeterministicEvents disallow("AllocationCounter::InvokeAllocationObservers");
+ 
+   DCHECK(!step_in_progress_);
+   DCHECK_GE(aligned_object_size, next_counter_ - current_counter_);
+diff --git a/src/heap/concurrent-allocator.cc b/src/heap/concurrent-allocator.cc
+index 416289b43a631d0e2f76455f82fc7202572ac78a..9220510b8463653ca1131ca8bc14e04204c73b41 100644
+--- a/src/heap/concurrent-allocator.cc
++++ b/src/heap/concurrent-allocator.cc
+@@ -183,7 +183,7 @@ ConcurrentAllocator::AllocateFromSpaceFreeList(size_t min_size_in_bytes,
+          origin == AllocationOrigin::kGC);
+   DCHECK_IMPLIES(!local_heap_, origin == AllocationOrigin::kGC);
+ 
+-  replayio::AutoDisallowEvents disallow("ConcurrentAllocator::AllocateFromSpaceFreeList");
++  replayio::AutoDisallowNondeterministicEvents disallow("ConcurrentAllocator::AllocateFromSpaceFreeList");
+ 
+   base::Optional<std::pair<Address, size_t>> result =
+       space_->TryAllocationFromFreeListBackground(min_size_in_bytes,
+diff --git a/src/heap/concurrent-marking.cc b/src/heap/concurrent-marking.cc
+index e75edce9596dd1852e4350676e13e6ced7efec2f..b04b45ec8b1e7d2d95cc51e57b7a3c60ed244c7a 100644
+--- a/src/heap/concurrent-marking.cc
++++ b/src/heap/concurrent-marking.cc
+@@ -953,7 +953,7 @@ void ConcurrentMarking::ScheduleJob(GarbageCollector garbage_collector,
+   DCHECK(!heap_->IsTearingDown());
+   DCHECK(IsStopped());
+ 
+-  replayio::AutoDisallowEvents disallow("ConcurrentMarking::ScheduleJob");
++  replayio::AutoDisallowNondeterministicEvents disallow("ConcurrentMarking::ScheduleJob");
+ 
+   garbage_collector_ = garbage_collector;
+   if (garbage_collector == GarbageCollector::MARK_COMPACTOR) {
+diff --git a/src/heap/cppgc/stats-collector.cc b/src/heap/cppgc/stats-collector.cc
+index 4974a54339f0101bbd81f63f1060976e5d0f01d3..e9f8e665c528755a94b90dc2d49818a742987a68 100644
+--- a/src/heap/cppgc/stats-collector.cc
++++ b/src/heap/cppgc/stats-collector.cc
+@@ -72,7 +72,7 @@ void StatsCollector::NotifySafePointForTesting() {
+ }
+ 
+ void StatsCollector::AllocatedObjectSizeSafepointImpl() {
+-  v8::replayio::AutoDisallowEvents disallow("StatsCollector::AllocatedObjectSizeSafepointImpl");
++  v8::replayio::AutoDisallowNondeterministicEvents disallow("StatsCollector::AllocatedObjectSizeSafepointImpl");
+ 
+   allocated_bytes_since_end_of_marking_ +=
+       static_cast<int64_t>(allocated_bytes_since_safepoint_) -
+diff --git a/src/heap/cppgc/sweeper.cc b/src/heap/cppgc/sweeper.cc
+index 47ff54eba002e052c633c7c86e9601ec6d075964..42bc66d3de4e6eb07d6f23b441110f98eeac8b59 100644
+--- a/src/heap/cppgc/sweeper.cc
++++ b/src/heap/cppgc/sweeper.cc
+@@ -775,7 +775,7 @@ class Sweeper::SweeperImpl final {
+   ~SweeperImpl() { CancelSweepers(); }
+ 
+   void Start(SweepingConfig config, cppgc::Platform* platform) {
+-    v8::replayio::AutoDisallowEvents disallow("SweeperImpl::Start");
++    v8::replayio::AutoDisallowNondeterministicEvents disallow("SweeperImpl::Start");
+     StatsCollector::EnabledScope stats_scope(stats_collector_,
+                                              StatsCollector::kAtomicSweep);
+     is_in_progress_ = true;
+@@ -810,7 +810,7 @@ class Sweeper::SweeperImpl final {
+ 
+   bool SweepForAllocationIfRunning(NormalPageSpace* space, size_t size,
+                                    v8::base::TimeDelta max_duration) {
+-    v8::replayio::AutoDisallowEvents disallow("Sweeper::SweepForAllocationIfRunning");
++    v8::replayio::AutoDisallowNondeterministicEvents disallow("Sweeper::SweepForAllocationIfRunning");
+ 
+     if (!is_in_progress_) return false;
+ 
+@@ -867,7 +867,7 @@ class Sweeper::SweeperImpl final {
+   }
+ 
+   bool FinishIfRunning() {
+-    v8::replayio::AutoDisallowEvents disallow("SweeperImpl::FinishIfRunning");
++    v8::replayio::AutoDisallowNondeterministicEvents disallow("SweeperImpl::FinishIfRunning");
+ 
+     if (!is_in_progress_) return false;
+ 
+diff --git a/src/heap/heap.cc b/src/heap/heap.cc
+index b479dcc203d0e186e18b8e3fdcf8ec52b99c5e41..3e5fdc7b032662b41964752c591f65b47dd07a32 100644
+--- a/src/heap/heap.cc
++++ b/src/heap/heap.cc
+@@ -1466,7 +1466,7 @@ void ReportDuplicates(int size, std::vector<HeapObject>* objects) {
+ }  // anonymous namespace
+ 
+ void Heap::CollectAllAvailableGarbage(GarbageCollectionReason gc_reason) {
+-  replayio::AutoDisallowEvents disallow("Heap::CollectAllAvailableGarbage");
++  replayio::AutoDisallowNondeterministicEvents disallow("Heap::CollectAllAvailableGarbage");
+   // Since we are ignoring the return value, the exact choice of space does
+   // not matter, so long as we do not specify NEW_SPACE, which would not
+   // cause a full GC.
+@@ -1536,7 +1536,7 @@ void Heap::PreciseCollectAllGarbage(int flags,
+ }
+ 
+ void Heap::ReportExternalMemoryPressure() {
+-  replayio::AutoDisallowEvents disallow("Heap::ReportExternalMemoryPressure");
++  replayio::AutoDisallowNondeterministicEvents disallow("Heap::ReportExternalMemoryPressure");
+ 
+   const GCCallbackFlags kGCCallbackFlagsForExternalMemory =
+       static_cast<GCCallbackFlags>(
+@@ -1593,7 +1593,7 @@ Heap::DevToolsTraceEventScope::~DevToolsTraceEventScope() {
+ bool Heap::CollectGarbage(AllocationSpace space,
+                           GarbageCollectionReason gc_reason,
+                           const v8::GCCallbackFlags gc_callback_flags) {
+-  replayio::AutoDisallowEvents disallow("Heap::CollectGarbage");
++  replayio::AutoDisallowNondeterministicEvents disallow("Heap::CollectGarbage");
+   if (V8_UNLIKELY(!deserialization_complete_)) {
+     // During isolate initialization heap always grows. GC is only requested
+     // if a new page allocation fails. In such a case we should crash with
+@@ -1837,7 +1837,7 @@ void Heap::StartIncrementalMarking(int gc_flags,
+                                    GarbageCollector collector) {
+   DCHECK(incremental_marking()->IsStopped());
+ 
+-  replayio::AutoDisallowEvents disallow("Heap::StartIncrementalMarking");
++  replayio::AutoDisallowNondeterministicEvents disallow("Heap::StartIncrementalMarking");
+ 
+   if (IsYoungGenerationCollector(collector)) {
+     CompleteSweepingYoung(collector);
+@@ -1890,7 +1890,7 @@ void Heap::CompleteSweepingFull() {
+ 
+ void Heap::StartIncrementalMarkingIfAllocationLimitIsReached(
+     int gc_flags, const GCCallbackFlags gc_callback_flags) {
+-  replayio::AutoDisallowEvents disallow("Heap::StartIncrementalMarkingIfAllocationLimitIsReached");
++  replayio::AutoDisallowNondeterministicEvents disallow("Heap::StartIncrementalMarkingIfAllocationLimitIsReached");
+   if (v8_flags.separate_gc_phases && gc_callbacks_depth_ > 0) {
+     // Do not start incremental marking while invoking GC callbacks.
+     // Heap::CollectGarbage already decided which GC is going to be invoked. In
+@@ -2396,7 +2396,7 @@ void Heap::CompleteSweepingYoung(GarbageCollector collector) {
+ }
+ 
+ void Heap::EnsureSweepingCompletedForObject(HeapObject object) {
+-  replayio::AutoDisallowEvents disallow("Heap::EnsureSweepingCompletedForObject");
++  replayio::AutoDisallowNondeterministicEvents disallow("Heap::EnsureSweepingCompletedForObject");
+ 
+   if (!sweeping_in_progress()) return;
+ 
+@@ -3723,7 +3723,7 @@ void Heap::ActivateMemoryReducerIfNeeded() {
+   const int kMinCommittedMemory = 7 * Page::kPageSize;
+   if (ms_count_ == 0 && CommittedMemory() > kMinCommittedMemory &&
+       isolate()->IsIsolateInBackground()) {
+-    replayio::AutoDisallowEvents disallow("Heap::ActivateMemoryReducerIfNeeded");
++    replayio::AutoDisallowNondeterministicEvents disallow("Heap::ActivateMemoryReducerIfNeeded");
+     MemoryReducer::Event event;
+     event.type = MemoryReducer::kPossibleGarbage;
+     event.time_ms = MonotonicallyIncreasingTimeInMs();
+@@ -3999,7 +3999,7 @@ void Heap::CheckMemoryPressure() {
+ }
+ 
+ void Heap::CollectGarbageOnMemoryPressure() {
+-  replayio::AutoDisallowEvents disallow("Heap::CollectGarbageOnMemoryPressure");
++  replayio::AutoDisallowNondeterministicEvents disallow("Heap::CollectGarbageOnMemoryPressure");
+ 
+   const int kGarbageThresholdInBytes = 8 * MB;
+   const double kGarbageThresholdAsFractionOfTotalMemory = 0.1;
+@@ -4038,7 +4038,7 @@ void Heap::CollectGarbageOnMemoryPressure() {
+ 
+ void Heap::MemoryPressureNotification(MemoryPressureLevel level,
+                                       bool is_isolate_locked) {
+-  replayio::AutoDisallowEvents disallow("Heap::MemoryPressureNotification");
++  replayio::AutoDisallowNondeterministicEvents disallow("Heap::MemoryPressureNotification");
+ 
+   TRACE_EVENT1("devtools.timeline,v8", "V8.MemoryPressureNotification", "level",
+                static_cast<int>(level));
+@@ -5082,7 +5082,7 @@ bool Heap::ShouldOptimizeForLoadTime() {
+ // - either we need to optimize for memory usage,
+ // - or the incremental marking is not in progress and we cannot start it.
+ bool Heap::ShouldExpandOldGenerationOnSlowAllocation(LocalHeap* local_heap) {
+-  replayio::AutoDisallowEvents disallow("Heap::ShouldExpandOldGenerationOnSlowAllocation");
++  replayio::AutoDisallowNondeterministicEvents disallow("Heap::ShouldExpandOldGenerationOnSlowAllocation");
+ 
+   // Always allow background threads to allocate while replaying without triggering GC.
+   // Waiting on a main thread GC can introduce deadlocks if the main thread
+@@ -5679,7 +5679,7 @@ void Heap::NotifyBootstrapComplete() {
+ 
+ void Heap::NotifyOldGenerationExpansion(AllocationSpace space,
+                                         MemoryChunk* chunk) {
+-  replayio::AutoDisallowEvents disallow("Heap::NotifyOldGenerationExpansion");
++  replayio::AutoDisallowNondeterministicEvents disallow("Heap::NotifyOldGenerationExpansion");
+ 
+   // Pages created during bootstrapping may contain immortal immovable objects.
+   if (!deserialization_complete()) {
+@@ -5773,7 +5773,7 @@ void Heap::RegisterExternallyReferencedObject(Address* location) {
+ }
+ 
+ void Heap::StartTearDown() {
+-  replayio::AutoDisallowEvents disallow("Heap::StartTearDown");
++  replayio::AutoDisallowNondeterministicEvents disallow("Heap::StartTearDown");
+ 
+   // Finish any ongoing sweeping to avoid stray background tasks still accessing
+   // the heap during teardown.
+@@ -7323,7 +7323,7 @@ void Heap::FinishSweepingIfOutOfWork() {
+ }
+ 
+ void Heap::EnsureSweepingCompleted(SweepingForcedFinalizationMode mode) {
+-  replayio::AutoDisallowEvents disallow("Heap::EnsureSweepingCompleted");
++  replayio::AutoDisallowNondeterministicEvents disallow("Heap::EnsureSweepingCompleted");
+ 
+   if (sweeper()->sweeping_in_progress()) {
+     TRACE_GC_EPOCH(tracer(), GCTracer::Scope::MC_COMPLETE_SWEEPING,
+diff --git a/src/heap/incremental-marking-job.cc b/src/heap/incremental-marking-job.cc
+index 481f669e4b48206cb6cd1d718f17455022a3a167..27bb5ee6ebe50f0e5068ccb12d3e97095bfa4ffa 100644
+--- a/src/heap/incremental-marking-job.cc
++++ b/src/heap/incremental-marking-job.cc
+@@ -40,7 +40,7 @@ class IncrementalMarkingJob::Task : public CancelableTask {
+ };
+ 
+ void IncrementalMarkingJob::ScheduleTask() {
+-  replayio::AutoDisallowEvents disallow("IncrementalMarkingJob::ScheduleTask");
++  replayio::AutoDisallowNondeterministicEvents disallow("IncrementalMarkingJob::ScheduleTask");
+ 
+   base::MutexGuard guard(&mutex_);
+ 
+@@ -71,7 +71,7 @@ void IncrementalMarkingJob::ScheduleTask() {
+ void IncrementalMarkingJob::Task::RunInternal() {
+   // RUN-2140: This shouldn't be necessary, this task should run at non-deterministic
+   // points in general and be unordered.
+-  replayio::AutoDisallowEvents disallow("IncrementalMarkingJob::Task::RunInternal");
++  replayio::AutoDisallowNondeterministicEvents disallow("IncrementalMarkingJob::Task::RunInternal");
+ 
+   VMState<GC> state(isolate());
+   TRACE_EVENT_CALL_STATS_SCOPED(isolate(), "v8", "V8.Task");
+diff --git a/src/heap/incremental-marking.cc b/src/heap/incremental-marking.cc
+index ca5bbf30fdf2a36bc36a6dad362919654f680a70..efd1c141652705df0b59424c47c6a852875e4e38 100644
+--- a/src/heap/incremental-marking.cc
++++ b/src/heap/incremental-marking.cc
+@@ -63,7 +63,7 @@ IncrementalMarking::IncrementalMarking(Heap* heap, WeakObjects* weak_objects)
+ 
+ void IncrementalMarking::MarkBlackAndVisitObjectDueToLayoutChange(
+     HeapObject obj) {
+-  replayio::AutoDisallowEvents disallow("IncrementalMarking::MarkBlackAndVisitObjectDueToLayoutChange");
++  replayio::AutoDisallowNondeterministicEvents disallow("IncrementalMarking::MarkBlackAndVisitObjectDueToLayoutChange");
+   // TODO(v8:13012): Add scope for MinorMC.
+   TRACE_EVENT0("v8", "V8.GCIncrementalMarkingLayoutChange");
+   TRACE_GC(heap()->tracer(), GCTracer::Scope::MC_INCREMENTAL_LAYOUT_CHANGE);
+diff --git a/src/heap/local-heap.cc b/src/heap/local-heap.cc
+index 4d15b9be3988898a7643647b5e342750bb52f300..d5296202adc6657d228bc84a46d1647690007330 100644
+--- a/src/heap/local-heap.cc
++++ b/src/heap/local-heap.cc
+@@ -269,7 +269,7 @@ void LocalHeap::ParkSlowPath() {
+ }
+ 
+ void LocalHeap::UnparkSlowPath() {
+-  replayio::AutoDisallowEvents disallow("LocalHeap::UnparkSlowPath");
++  replayio::AutoDisallowNondeterministicEvents disallow("LocalHeap::UnparkSlowPath");
+ 
+   while (true) {
+     ThreadState current_state = ThreadState::Parked();
+@@ -331,7 +331,7 @@ void LocalHeap::EnsureParkedBeforeDestruction() {
+ }
+ 
+ void LocalHeap::SafepointSlowPath() {
+-  replayio::AutoDisallowEvents disallow("LocalHeap::SafepointSlowPath");
++  replayio::AutoDisallowNondeterministicEvents disallow("LocalHeap::SafepointSlowPath");
+ 
+   ThreadState current_state = state_.load_relaxed();
+   DCHECK(current_state.IsRunning());
+@@ -424,7 +424,7 @@ void LocalHeap::UnmarkSharedLinearAllocationArea() {
+ Address LocalHeap::PerformCollectionAndAllocateAgain(
+     int object_size, AllocationType type, AllocationOrigin origin,
+     AllocationAlignment alignment) {
+-  replayio::AutoDisallowEvents disallow("LocalHeap::PerformCollectionAndAllocateAgain");
++  replayio::AutoDisallowNondeterministicEvents disallow("LocalHeap::PerformCollectionAndAllocateAgain");
+ 
+   CHECK(!allocation_failed_);
+   CHECK(!main_thread_parked_);
+diff --git a/src/heap/paged-spaces.cc b/src/heap/paged-spaces.cc
+index 00d9eff55a4fb98eb2384bb55368813f5af109b5..e2dba57c213c79230e790c3316231496019706d4 100644
+--- a/src/heap/paged-spaces.cc
++++ b/src/heap/paged-spaces.cc
+@@ -908,7 +908,7 @@ bool PagedSpaceBase::RawRefillLabMain(int size_in_bytes,
+   DCHECK_GE(size_in_bytes, 0);
+   const int kMaxPagesToSweep = 1;
+ 
+-  replayio::AutoDisallowEvents disallow("PagedSpaceBase::RawRefillLabMain");
++  replayio::AutoDisallowNondeterministicEvents disallow("PagedSpaceBase::RawRefillLabMain");
+ 
+   if (TryAllocationFromFreeListMain(size_in_bytes, origin)) return true;
+ 
+diff --git a/src/inspector/v8-runtime-agent-impl.cc b/src/inspector/v8-runtime-agent-impl.cc
+index 7d7bb167f02f0c9d82e0dd2bf2947bb1bfcda5a9..1090e4db67f2add1fb92f1fd394b061bbca3b21c 100644
+--- a/src/inspector/v8-runtime-agent-impl.cc
++++ b/src/inspector/v8-runtime-agent-impl.cc
+@@ -258,7 +258,8 @@ V8RuntimeAgentImpl::V8RuntimeAgentImpl(
+       m_enabled(false),
+       m_replay_owned(
+           (!v8::recordreplay::FeatureEnabled("replay-only-command-handling") ||
+-           v8::recordreplay::IsReplaying()) &&
++           v8::recordreplay::IsReplaying() ||
++           v8::recordreplay::IsSameOnBothSides()) &&
+           v8::recordreplay::AreEventsDisallowed()) {}
+ 
+ V8RuntimeAgentImpl::~V8RuntimeAgentImpl() = default;
+diff --git a/src/interpreter/bytecode-array-builder.cc b/src/interpreter/bytecode-array-builder.cc
+index 3f0d2d324a3dfe1c78bf11bd6ee3abcfa38f00b4..954231f869a7a99f7c2593a5238b00fff6b33358 100644
+--- a/src/interpreter/bytecode-array-builder.cc
++++ b/src/interpreter/bytecode-array-builder.cc
+@@ -1381,7 +1381,8 @@ BytecodeArrayBuilder& BytecodeArrayBuilder::IncBlockCounter(
+ BytecodeArrayBuilder& BytecodeArrayBuilder::RecordReplayOnProgress() {
+   if (emit_record_replay_opcodes_) {
+     OutputRecordReplayIncExecutionProgressCounter();
+-  } else if (recordreplay::IsReplaying()) {
++  } else if (recordreplay::IsReplaying() &&
++             !recordreplay::IsSameOnBothSides()) {
+     OutputRecordReplayNotifyActivity();
+   }
+   return *this;
+@@ -1417,7 +1418,9 @@ bool BytecodeArrayBuilder::EmitRecordReplayInstrumentationOpcodes() const {
+   // Instrumentation opcodes aren't needed when recording, except when we are asserting
+   // encountered values and need consistent IDs for these objects when recording.
+   // Generator instrumentation will create persistent object IDs.
+-  return emit_record_replay_opcodes_ && (recordreplay::IsReplaying() || gRecordReplayAssertTrackedObjects);
++  return emit_record_replay_opcodes_ &&
++         (recordreplay::IsReplaying() || gRecordReplayAssertTrackedObjects ||
++          recordreplay::IsSameOnBothSides());
+ }
+ 
+ BytecodeArrayBuilder& BytecodeArrayBuilder::RecordReplayInstrumentation(
+diff --git a/src/replay/replay-runtime-weak-refs.cc b/src/replay/replay-runtime-weak-refs.cc
+index d0779280c4dbf75fec3cc9ef838a1443ad96c092..a537b1267f2116d9bf7fa132b13ed1844b6566e0 100644
+--- a/src/replay/replay-runtime-weak-refs.cc
++++ b/src/replay/replay-runtime-weak-refs.cc
+@@ -14,7 +14,7 @@ RUNTIME_FUNCTION(Runtime_JSReplayWeakRefConstruct) {
+   DCHECK_EQ(1, args.length());
+   Handle<HeapObject> object = args.at<HeapObject>(0);
+ 
+-  if (recordreplay::IsReplaying()) {
++  if (recordreplay::IsReplaying() && !recordreplay::IsSameOnBothSides()) {
+     replayio::ReplayWeakRefPins::Pin(isolate, *object);
+   }
+ 
+diff --git a/src/wasm/module-compiler.cc b/src/wasm/module-compiler.cc
+index 285f36550ecd6676789c2ed2678e61c1c9b48850..94ff968493eab57ebb124865d7c881b412fb9ce2 100644
+--- a/src/wasm/module-compiler.cc
++++ b/src/wasm/module-compiler.cc
+@@ -1457,7 +1457,7 @@ void TransitiveTypeFeedbackProcessor::ProcessFunction(int func_index) {
+ }
+ 
+ void TriggerTierUp(WasmInstanceObject instance, int func_index) {
+-  replayio::AutoDisallowEvents disallow("wasm::TriggerTierUp");
++  replayio::AutoDisallowNondeterministicEvents disallow("wasm::TriggerTierUp");
+ 
+   NativeModule* native_module = instance.module_object().native_module();
+   CompilationStateImpl* compilation_state =

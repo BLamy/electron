@@ -118,6 +118,9 @@
 #include "shell/common/plugin_info.h"
 #endif  // BUILDFLAG(ENABLE_PLUGINS)
 
+extern "C" void V8RecordReplaySetDefaultContext(v8::Isolate* isolate,
+                                                v8::Local<v8::Context> cx);
+
 namespace electron {
 
 namespace {
@@ -264,6 +267,13 @@ void ElectronBrowserMainParts::PostEarlyInitialization() {
   js_env_ = std::make_unique<JavascriptEnvironment>(node_bindings_->uv_loop());
 
   v8::HandleScope scope(js_env_->isolate());
+
+  // When recording or replaying, what the main process runs is in this context,
+  // and it's where the debugger's commands run when nothing's on the stack. It
+  // has to be known before scripts compile and checkpoints are made.
+  if (v8::recordreplay::IsRecordingOrReplaying()) {
+    V8RecordReplaySetDefaultContext(js_env_->isolate(), js_env_->context());
+  }
 
   node_bindings_->Initialize();
   // Create the global environment.

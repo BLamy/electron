@@ -1,0 +1,305 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Brett Lamy <blamy@Bretts-MacBook-Pro.local>
+Date: Tue, 3 Nov 2026 03:02:57 -0500
+Subject: Turn off Chromium's annotations in an Electron browser process
+
+The driver runs its recorded threads one at a time, and it behaves as a stock
+browser process does, so it needs none of them. As far as they're concerned it's
+not recording, apart from what makes a recording: checkpoints, and finishing it.
+
+diff --git a/base/record_replay.cc b/base/record_replay.cc
+index 9e346bcbbcce4c240ae0c9bfff8c3ac8f78b1d8d..ff2045a909f0a13d8ca91383855422e8dccaa98d 100644
+--- a/base/record_replay.cc
++++ b/base/record_replay.cc
+@@ -226,15 +226,34 @@ ForEachV8APIVoid(DefineFunctionVoid)
+ 
+ #endif // !BUILD_FLAG(IS_WIN)
+ 
++// An Electron browser process needs none of the annotations in Chromium: the
++// driver runs its recorded threads one at a time, and it behaves as a stock
++// browser process does. So as far as they're concerned it's not recording, apart
++// from what makes a recording: checkpoints, and finishing it. See
++// recordreplay::IsSameOnBothSides in V8.
++#if !BUILDFLAG(IS_WIN)
++extern "C" bool V8RecordReplayIsSameOnBothSides();
++static inline bool Unannotated() {
++  return V8RecordReplayIsSameOnBothSides();
++}
++#else
++static inline bool Unannotated() {
++  return false;
++}
++#endif
++
+ bool IsRecordingOrReplaying(const char* feature, const char* subfeature) {
+-  return V8IsRecordingOrReplaying(feature, subfeature);
++  return !Unannotated() && V8IsRecordingOrReplaying(feature, subfeature);
+ }
+ 
+ bool IsRecording() {
+-  return V8IsRecording();
++  return Unannotated() || V8IsRecording();
+ }
+ 
+ bool IsReplaying() {
++  if (Unannotated()) {
++    return false;
++  }
+   return V8IsReplaying();
+ }
+ 
+@@ -247,10 +266,16 @@ bool HadMismatch() {
+ }
+ 
+ bool HasAsserts() {
++  if (Unannotated()) {
++    return false;
++  }
+   return V8RecordReplayHasAsserts();
+ }
+ 
+ void Assert(const char* format, ...) {
++  if (Unannotated()) {
++    return;
++  }
+ #ifndef NACL_TC_REV
+   va_list ap;
+   va_start(ap, format);
+@@ -260,6 +285,9 @@ void Assert(const char* format, ...) {
+ }
+ 
+ void AssertMaybeEventsDisallowed(const char* format, ...) {
++  if (Unannotated()) {
++    return;
++  }
+ #ifndef NACL_TC_REV
+   va_list ap;
+   va_start(ap, format);
+@@ -314,10 +342,16 @@ void Trace(const char* format, ...) {
+ }
+ 
+ void AssertBytes(const char* why, const void* buf, size_t size) {
++  if (Unannotated()) {
++    return;
++  }
+   V8RecordReplayAssertBytes(why, buf, size);
+ }
+ 
+ bool AreAssertsDisabled() {
++  if (Unannotated()) {
++    return true;
++  }
+   return V8RecordReplayAreAssertsDisabled();
+ }
+ 
+@@ -331,10 +365,16 @@ void Print(const char* format, ...) {
+ }
+ 
+ uintptr_t RecordReplayValue(const char* why, uintptr_t v) {
++  if (Unannotated()) {
++    return v;
++  }
+   return V8RecordReplayValue(why, v);
+ }
+ 
+ void RecordReplayBytes(const char* why, void* buf, size_t size) {
++  if (Unannotated()) {
++    return;
++  }
+   V8RecordReplayBytes(why, buf, size);
+ }
+ 
+@@ -347,14 +387,23 @@ void RecordReplayString(const char* why, std::string& str) {
+ }
+ 
+ int CreateOrderedLock(const char* name) {
++  if (Unannotated()) {
++    return 0;
++  }
+   return (int)V8RecordReplayCreateOrderedLock(name);
+ }
+ 
+ void OrderedLock(int lock) {
++  if (Unannotated()) {
++    return;
++  }
+   V8RecordReplayOrderedLock(lock);
+ }
+ 
+ void OrderedUnlock(int lock) {
++  if (Unannotated()) {
++    return;
++  }
+   V8RecordReplayOrderedUnlock(lock);
+ }
+ 
+@@ -363,58 +412,100 @@ void NewCheckpoint() {
+ }
+ 
+ uint64_t NewBookmark() {
++  if (Unannotated()) {
++    return 0;
++  }
+   return V8RecordReplayNewBookmark();
+ }
+ 
+ void OnAnnotation(const char* kind, const char* contents) {
++  if (Unannotated()) {
++    return;
++  }
+   V8RecordReplayOnAnnotation(kind, contents);
+ }
+ 
+ void OnNetworkRequest(const char* id, const char* kind, uint64_t bookmark) {
++  if (Unannotated()) {
++    return;
++  }
+   V8RecordReplayOnNetworkRequest(id, kind, bookmark);
+ }
+ 
+ void OnNetworkRequestEvent(const char* id) {
++  if (Unannotated()) {
++    return;
++  }
+   V8RecordReplayOnNetworkRequestEvent(id);
+ }
+ 
+ void OnNetworkStreamStart(const char* id, const char* kind, const char* parentId) {
++  if (Unannotated()) {
++    return;
++  }
+   V8RecordReplayOnNetworkStreamStart(id, kind, parentId);
+ }
+ 
+ void OnNetworkStreamData(const char* id, size_t offset, size_t length, uint64_t bookmark) {
++  if (Unannotated()) {
++    return;
++  }
+   V8RecordReplayOnNetworkStreamData(id, offset, length, bookmark);
+ }
+ 
+ void OnNetworkStreamEnd(const char* id, size_t length) {
++  if (Unannotated()) {
++    return;
++  }
+   V8RecordReplayOnNetworkStreamEnd(id, length);
+ }
+ 
+ bool AreEventsDisallowed(const char* why) {
++  if (Unannotated()) {
++    return false;
++  }
+   return V8RecordReplayAreEventsDisallowed(why);
+ }
+ 
+ void BeginDisallowEvents() {
++  if (Unannotated()) {
++    return;
++  }
+   V8RecordReplayBeginDisallowEvents();
+ }
+ 
+ void BeginDisallowEventsWithLabel(const char* label) {
++  if (Unannotated()) {
++    return;
++  }
+   V8RecordReplayBeginDisallowEventsWithLabel(label);
+ }
+ 
+ void EndDisallowEvents() {
++  if (Unannotated()) {
++    return;
++  }
+   V8RecordReplayEndDisallowEvents();
+ }
+ 
+ bool AreEventsPassedThrough(const char* why) {
++  if (Unannotated()) {
++    return false;
++  }
+   return V8RecordReplayAreEventsPassedThrough(why);
+ }
+ 
+ void BeginPassThroughEvents() {
++  if (Unannotated()) {
++    return;
++  }
+   V8RecordReplayBeginPassThroughEvents();
+ }
+ 
+ void EndPassThroughEvents() {
++  if (Unannotated()) {
++    return;
++  }
+   V8RecordReplayEndPassThroughEvents();
+ }
+ 
+@@ -445,22 +536,37 @@ bool AllowSideEffects() {
+ }
+ 
+ void RegisterPointer(const char* name, const void* ptr) {
++  if (Unannotated()) {
++    return;
++  }
+   V8RecordReplayRegisterPointer(name, ptr);
+ }
+ 
+ void UnregisterPointer(const void* ptr) {
++  if (Unannotated()) {
++    return;
++  }
+   V8RecordReplayUnregisterPointer(ptr);
+ }
+ 
+ int PointerId(const void* ptr) {
++  if (Unannotated()) {
++    return 0;
++  }
+   return V8RecordReplayPointerId(ptr);
+ }
+ 
+ void* IdPointer(int id) {
++  if (Unannotated()) {
++    return nullptr;
++  }
+   return V8RecordReplayIdPointer(id);
+ }
+ 
+ void OnEvent(const char* aEvent, bool aBefore) {
++  if (Unannotated()) {
++    return;
++  }
+   V8RecordReplayOnEvent(aEvent, aBefore);
+ }
+ void OnMouseEvent(const char* kind,
+@@ -511,18 +617,30 @@ bool DependencyGraphEnabled() {
+ }
+ 
+ int NewDependencyGraphNode(const char* json) {
++  if (Unannotated()) {
++    return 0;
++  }
+   return V8RecordReplayNewDependencyGraphNode(json);
+ }
+ 
+ void AddDependencyGraphEdge(int source, int target, const char* json) {
++  if (Unannotated()) {
++    return;
++  }
+   V8RecordReplayAddDependencyGraphEdge(source, target, json);
+ }
+ 
+ void BeginDependencyExecution(int node) {
++  if (Unannotated()) {
++    return;
++  }
+   V8RecordReplayBeginDependencyExecution(node);
+ }
+ 
+ void EndDependencyExecution() {
++  if (Unannotated()) {
++    return;
++  }
+   V8RecordReplayEndDependencyExecution();
+ }
+ 

@@ -119,3 +119,4 @@ fix_on-screen-keyboard_hides_on_input_blur_in_webview.patch
 preconnect_manager.patch
 fix_remove_caption-removing_style_call.patch
 build_allow_electron_to_use_exec_script.patch
+turn_off_chromium_s_annotations_in_an_electron_browser_process.patch

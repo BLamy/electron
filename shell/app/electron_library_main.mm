@@ -10,6 +10,8 @@
 #include "base/i18n/icu_util.h"
 #include "base/mac/bundle_locations.h"
 #include "base/mac/scoped_nsautorelease_pool.h"
+#include "base/power_monitor/power_monitor.h"
+#include "base/record_replay.h"
 #include "content/public/app/content_main.h"
 #include "electron/fuses.h"
 #include "shell/app/electron_main_delegate.h"
@@ -17,7 +19,21 @@
 #include "shell/common/electron_command_line.h"
 #include "shell/common/mac/main_application_bundle.h"
 
+extern "C" void* ReplayDriverHandle();
+extern "C" void V8SetRecordingOrReplaying(void* handle);
+
 int ElectronMain(int argc, char* argv[]) {
+  // The driver has already attached, in shell/app/replay_attach_mac.c. Tell V8.
+  if (void* driver = ReplayDriverHandle()) {
+    V8SetRecordingOrReplaying(driver);
+  }
+  if (recordreplay::IsRecordingOrReplaying("eager-initialization",
+                                           "ElectronMain")) {
+    // Force initialization that can otherwise happen at non-deterministic
+    // points, as ChromeMain does.
+    base::PowerMonitor::GetInstance();
+  }
+
   electron::ElectronMainDelegate delegate;
   content::ContentMainParams params(&delegate);
   params.argc = argc;
