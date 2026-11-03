@@ -22,10 +22,10 @@ However, the patch would need to be reviewed by the security team, as it
 does touch a security-sensitive class.
 
 diff --git a/content/browser/renderer_host/render_process_host_impl.cc b/content/browser/renderer_host/render_process_host_impl.cc
-index 446a67010214e68d5981c74e9c3923cec16edc60..d0b9284fcd1120722b751a462f7018353e7b07c3 100644
+index fdb577c13efe3eebdefdd80c0de4fd39a4d7bb54..394142baba8f5408cefdfccd5c63b5fd7454de2b 100644
 --- a/content/browser/renderer_host/render_process_host_impl.cc
 +++ b/content/browser/renderer_host/render_process_host_impl.cc
-@@ -1766,9 +1766,15 @@ bool RenderProcessHostImpl::Init() {
+@@ -1777,9 +1777,15 @@ bool RenderProcessHostImpl::Init() {
      std::unique_ptr<SandboxedProcessLauncherDelegate> sandbox_delegate =
          std::make_unique<RendererSandboxedProcessLauncherDelegateWin>(
              cmd_line.get(), IsJitDisabled());
@@ -42,12 +42,12 @@ index 446a67010214e68d5981c74e9c3923cec16edc60..d0b9284fcd1120722b751a462f701835
  
      auto file_data = std::make_unique<ChildProcessLauncherFileData>();
 diff --git a/content/browser/renderer_host/renderer_sandboxed_process_launcher_delegate.cc b/content/browser/renderer_host/renderer_sandboxed_process_launcher_delegate.cc
-index 81f25ee3d7eb26a336cae05bd158e3cd1ec07257..9d95eccc579e0778f0b3f3a3a31817380e3989c2 100644
+index 0797532c0027ddc5ea8540c2347e60b339d33d42..3c34f250b7c90e73ace95930ca853327ee1bde04 100644
 --- a/content/browser/renderer_host/renderer_sandboxed_process_launcher_delegate.cc
 +++ b/content/browser/renderer_host/renderer_sandboxed_process_launcher_delegate.cc
-@@ -31,6 +31,9 @@ namespace content {
- 
- #if BUILDFLAG(USE_ZYGOTE_HANDLE)
+@@ -34,6 +34,9 @@ static inline bool MaybeRecordingOrReplaying() {
+   return true;
+ }
  ZygoteHandle RendererSandboxedProcessLauncherDelegate::GetZygote() {
 +  if (!use_zygote_) {
 +    return nullptr;
@@ -55,7 +55,7 @@ index 81f25ee3d7eb26a336cae05bd158e3cd1ec07257..9d95eccc579e0778f0b3f3a3a3181738
    const base::CommandLine& browser_command_line =
        *base::CommandLine::ForCurrentProcess();
    base::CommandLine::StringType renderer_prefix =
-@@ -60,6 +63,9 @@ RendererSandboxedProcessLauncherDelegateWin::
+@@ -66,6 +69,9 @@ RendererSandboxedProcessLauncherDelegateWin::
            GetContentClient()->browser()->IsRendererCodeIntegrityEnabled()),
        renderer_app_container_disabled_(
            GetContentClient()->browser()->IsRendererAppContainerDisabled()) {

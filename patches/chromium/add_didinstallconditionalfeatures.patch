@@ -23,11 +23,11 @@ index 0af40eb8f556aa29c8b7e1bdd0d62b1fb7b38791..b3ae64cf8836fdd3634bfd24fc2f8a25
                                          int32_t world_id) {}
    virtual void DidClearWindowObject() {}
 diff --git a/content/renderer/render_frame_impl.cc b/content/renderer/render_frame_impl.cc
-index fb0483af59b0e289bd716a3417a545233f17be1f..6a7e5ab92e6fa23762794efc3031ce982836c20e 100644
+index 3aaf5fa02bd709f9e69ef176dd36fa251c198886..c756e87d4a0c86df678a35769dcd1190dd1e89e9 100644
 --- a/content/renderer/render_frame_impl.cc
 +++ b/content/renderer/render_frame_impl.cc
-@@ -4365,6 +4365,12 @@ void RenderFrameImpl::DidCreateScriptContext(v8::Local<v8::Context> context,
-     observer.DidCreateScriptContext(context, world_id);
+@@ -4383,6 +4383,12 @@ void RenderFrameImpl::DidCreateScriptContext(v8::Local<v8::Context> context,
+   }
  }
  
 +void RenderFrameImpl::DidInstallConditionalFeatures(
@@ -67,17 +67,17 @@ index 149ca596036a4a4c123b6982014001953cf06800..dd069baf01929b75f42093ecf09ecf8e
    virtual void WillReleaseScriptContext(v8::Local<v8::Context>,
                                          int32_t world_id) {}
 diff --git a/third_party/blink/renderer/bindings/core/v8/local_window_proxy.cc b/third_party/blink/renderer/bindings/core/v8/local_window_proxy.cc
-index d0b5233ad45995bd6128a03fe9267618d723d683..e5e93be8f2433196a13aa104241b1ddd63985e81 100644
+index cfb1eb996cfd924bf9c57aa66925d47b4ffdef73..6ffe488530677b828f8204a4c3c0232a7465e538 100644
 --- a/third_party/blink/renderer/bindings/core/v8/local_window_proxy.cc
 +++ b/third_party/blink/renderer/bindings/core/v8/local_window_proxy.cc
-@@ -210,6 +210,7 @@ void LocalWindowProxy::Initialize() {
+@@ -302,6 +302,7 @@ void LocalWindowProxy::Initialize() {
    }
  
    InstallConditionalFeatures();
 +  GetFrame()->Client()->DidInstallConditionalFeatures(context, world_->GetWorldId());
  
-   if (World().IsMainWorld()) {
-     GetFrame()->Loader().DispatchDidClearWindowObjectInMainWorld();
+   // Add an event listener for the dispatched custom event the devtools uses to register
+   // its listener.  Do this outside the recording.
 diff --git a/third_party/blink/renderer/core/frame/local_frame_client.h b/third_party/blink/renderer/core/frame/local_frame_client.h
 index 83a62e23b1d395b0aa545de5b828c24196cccc6d..0ca8163eb9ab87aead27bc8b2ee9e614d7e1d8c7 100644
 --- a/third_party/blink/renderer/core/frame/local_frame_client.h

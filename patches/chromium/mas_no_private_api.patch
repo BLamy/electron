@@ -84,12 +84,12 @@ index add9345fdd076698fc7ec654d7ef1701699639a4..13e615dbbe0fca71acea1f4949442629
  
  }  // namespace
 diff --git a/content/renderer/theme_helper_mac.mm b/content/renderer/theme_helper_mac.mm
-index f50448237c40710e25644c2f7d44e8d0bc0789c8..fd351c916993a8950b595c103f3f5a4086d5480b 100644
+index fb6d94ae787643f67f6095c41c40268df0a2c84c..9e97e839c8eef830e549618baec7672de90fa28a 100644
 --- a/content/renderer/theme_helper_mac.mm
 +++ b/content/renderer/theme_helper_mac.mm
-@@ -7,11 +7,11 @@
- #include <Cocoa/Cocoa.h>
+@@ -8,11 +8,11 @@
  
+ #include "base/record_replay.h"
  #include "base/strings/sys_string_conversions.h"
 -
 +#if !defined(MAS_BUILD)
@@ -101,7 +101,7 @@ index f50448237c40710e25644c2f7d44e8d0bc0789c8..fd351c916993a8950b595c103f3f5a40
  namespace content {
  
  void SystemColorsDidChange(int aqua_color_variant,
-@@ -59,8 +59,19 @@ void SystemColorsDidChange(int aqua_color_variant,
+@@ -60,8 +60,19 @@ void SystemColorsDidChange(int aqua_color_variant,
  bool IsSubpixelAntialiasingAvailable() {
    if (__builtin_available(macOS 10.14, *)) {
      // See https://trac.webkit.org/changeset/239306/webkit for more info.
