@@ -14,6 +14,7 @@
 #include "gin/object_template_builder.h"
 #include "gin/wrappable.h"
 #include "services/service_manager/public/cpp/interface_provider.h"
+#include "shell/common/replay_ipc_log.h"
 #include "shell/common/api/api.mojom.h"
 #include "shell/common/gc_plugin.h"
 #include "shell/common/gin_converters/blink_converter.h"
@@ -86,6 +87,8 @@ class IPCBase : public gin::Wrappable<T> {
     if (!electron::SerializeV8Value(isolate, arguments, &message)) {
       return;
     }
+    if (!internal)
+      electron::replay::LogIpc("send", channel);
     electron_ipc_remote_->Message(internal, channel, std::move(message));
   }
 
@@ -105,12 +108,16 @@ class IPCBase : public gin::Wrappable<T> {
     gin_helper::Promise<electron::SerializedValue> p(isolate);
     auto handle = p.GetHandle();
 
-    electron_ipc_remote_->Invoke(
-        internal, channel, std::move(message),
-        base::BindOnce(
-            [](gin_helper::Promise<electron::SerializedValue> p,
-               electron::SerializedValue result) { p.Resolve(result); },
-            std::move(p)));
+    electron::mojom::ElectronApiIPC::InvokeCallback callback = base::BindOnce(
+        [](gin_helper::Promise<electron::SerializedValue> p,
+           electron::SerializedValue result) { p.Resolve(result); },
+        std::move(p));
+    if (!internal) {
+      callback = electron::replay::LogIpcCall("invoke", channel, 0,
+                                              std::move(callback));
+    }
+    electron_ipc_remote_->Invoke(internal, channel, std::move(message),
+                                 std::move(callback));
 
     return handle;
   }
@@ -185,9 +192,12 @@ class IPCBase : public gin::Wrappable<T> {
       return {};
     }
 
+    int id = internal ? 0 : electron::replay::LogIpc("sendSync", channel);
     electron::SerializedValue result;
     electron_ipc_remote_->MessageSync(internal, channel, std::move(message),
                                       &result);
+    if (id)
+      electron::replay::LogIpc("reply", channel, 0, id);
     return electron::DeserializeV8Value(isolate, result);
   }
 

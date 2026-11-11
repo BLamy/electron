@@ -15,6 +15,7 @@
 #include "base/i18n/rtl.h"
 #include "base/no_destructor.h"
 #include "base/path_service.h"
+#include "base/record_replay.h"
 #include "base/run_loop.h"
 #include "base/strings/string_number_conversions.h"
 #include "base/task/single_thread_task_runner.h"
@@ -688,6 +689,11 @@ void ElectronBrowserMainParts::PostCreateMainMessageLoop() {
 }
 
 void ElectronBrowserMainParts::PostMainMessageLoopRun() {
+  // A recording ends here, with V8 still there to answer what the debugger asks
+  // about its last point, as a renderer's recording does. This exits when it's
+  // recording, and renderers exit when they see that.
+  recordreplay::FinishRecording();
+
 #if BUILDFLAG(IS_MAC)
   FreeAppDelegate();
 #endif

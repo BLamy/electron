@@ -10,6 +10,7 @@
 
 #include "gin/converter.h"
 #include "mojo/public/cpp/platform/platform_handle.h"
+#include "shell/common/replay_ipc_log.h"
 #include "shell/common/api/electron_api_shared_texture.h"
 #include "shell/common/gin_converters/blink_converter.h"
 #include "shell/common/gin_converters/serialized_value_converter.h"
@@ -204,6 +205,9 @@ void ElectronApiServiceImpl::Message(bool internal,
   blink::WebLocalFrame* frame = render_frame()->GetWebFrame();
   if (!frame)
     return;
+
+  if (!internal)
+    replay::LogIpc("message", channel);
 
   v8::Isolate* isolate = frame->GetAgentGroupScheduler()->Isolate();
   v8::HandleScope handle_scope(isolate);

@@ -787,6 +787,8 @@ filenames = {
     "shell/common/platform_util_internal.h",
     "shell/common/process_util.cc",
     "shell/common/process_util.h",
+    "shell/common/replay_ipc_log.cc",
+    "shell/common/replay_ipc_log.h",
     "shell/common/skia_util.cc",
     "shell/common/skia_util.h",
     "shell/common/thread_restrictions.h",

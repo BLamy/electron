@@ -31,6 +31,7 @@
 #include "shell/browser/api/message_port.h"
 #include "shell/browser/browser.h"
 #include "shell/browser/javascript_environment.h"
+#include "shell/common/replay_ipc_log.h"
 #include "shell/common/api/api.mojom.h"
 #include "shell/common/gin_converters/blink_converter.h"
 #include "shell/common/gin_converters/frame_converter.h"
@@ -448,6 +449,8 @@ void WebFrameMain::DeliverMessage(v8::Isolate* isolate,
         "Render frame was disposed before WebFrameMain could be accessed");
     return;
   }
+  if (!internal)
+    replay::LogIpc("sendToRenderer", channel, OSProcessID());
   GetRendererApi()->Message(internal, channel, std::move(message));
 }
 

@@ -18,6 +18,7 @@
 #include "shell/browser/javascript_environment.h"
 #include "shell/common/gin_converters/serialized_value_converter.h"
 #include "shell/common/gin_helper/reply_channel.h"
+#include "shell/common/replay_ipc_log.h"
 #include "shell/common/v8_util.h"
 
 namespace electron {
@@ -45,6 +46,12 @@ void ElectronApiIPCHandlerImpl::OnConnectionError() {
   delete this;
 }
 
+// The renderer a message came from, for matching the two sides up when recording.
+int ElectronApiIPCHandlerImpl::SenderProcessId() {
+  auto* rfh = GetRenderFrameHost();
+  return rfh ? rfh->GetProcess()->GetProcess().Pid() : 0;
+}
+
 void ElectronApiIPCHandlerImpl::Message(bool internal,
                                         const std::string& channel,
                                         electron::SerializedValue arguments) {
@@ -57,10 +64,16 @@ void ElectronApiIPCHandlerImpl::Message(bool internal,
       return;
     if (!ipc_dispatch::IsReady())
       return;
+    // A listener can destroy this, so what the log needs is read first.
+    const int peer = SenderProcessId();
+    const int id = internal ? 0 : replay::LogIpc("send", channel, peer);
+    const std::string logged_channel = id ? channel : std::string();
     ipc_dispatch::Message(isolate, api::WebContents::From(web_contents()),
                           event, internal, channel,
                           gin::ConvertToV8(isolate, arguments),
                           /*sync=*/false);
+    if (id)
+      replay::LogIpc("handled", logged_channel, peer, id);
   }
 }
 void ElectronApiIPCHandlerImpl::Invoke(bool internal,
@@ -71,6 +84,10 @@ void ElectronApiIPCHandlerImpl::Invoke(bool internal,
   if (session && session->Get()) {
     v8::Isolate* isolate = electron::JavascriptEnvironment::GetIsolate();
     v8::HandleScope handle_scope(isolate);
+    if (!internal) {
+      callback = replay::LogIpcCall("invoke", channel, SenderProcessId(),
+                                    std::move(callback));
+    }
     auto* event =
         MakeIPCEvent(isolate, session->Get(), internal, std::move(callback));
     if (!event)
@@ -114,6 +131,10 @@ void ElectronApiIPCHandlerImpl::MessageSync(bool internal,
   if (session && session->Get()) {
     v8::Isolate* isolate = electron::JavascriptEnvironment::GetIsolate();
     v8::HandleScope handle_scope(isolate);
+    if (!internal) {
+      callback = replay::LogIpcCall("sendSync", channel, SenderProcessId(),
+                                    std::move(callback));
+    }
     auto* event =
         MakeIPCEvent(isolate, session->Get(), internal, std::move(callback));
     if (!event)
