@@ -1488,7 +1488,14 @@ if (is_mac) {
       framework_contents += [ "Helpers" ]
     }
     public_deps = [ ":electron_lib" ]
-    deps = [ "//third_party/electron_node:libnode" ]
+
+    # The framework is linked against Replay's attach library, so the loader
+    # runs it, and attaches the driver, before the framework's own static
+    # initializers. In Electron 46 a bundle dependency no longer does that.
+    deps = [
+      ":replay_attach",
+      "//third_party/electron_node:libnode",
+    ]
 
     # bundle_deps reach the bundle but not the framework's link, which
     # :electron_resource_allowlist (and through it :packed_resources) depends

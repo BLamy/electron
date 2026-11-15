@@ -210,6 +210,14 @@ void* PrefetchThreadMain(void* arg) {
 }  // namespace
 
 void PrefetchFrameworkFilesIfCold() {
+  // Whether the framework's pages are in memory is the machine's state, not
+  // the program's: a recorded main process found them cold and started the
+  // prefetch thread, its replay found them warm and didn't, and the two were
+  // different runs from there. Nothing is prefetched when Replay's driver is
+  // attached.
+  if (dlsym(RTLD_DEFAULT, "RecordReplayAttach")) {
+    return;
+  }
   Dl_info info;
   if (!dladdr(reinterpret_cast<const void*>(&PrefetchFrameworkFilesIfCold),
               &info) ||

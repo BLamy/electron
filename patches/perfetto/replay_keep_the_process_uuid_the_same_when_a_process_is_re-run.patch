@@ -1,0 +1,58 @@
+From f237374c5f05b8dfffb8dccc7625f0636a0ed43b Mon Sep 17 00:00:00 2001
+From: Brett Lamy <brett.lamy@replay.io>
+Date: Sun, 15 Nov 2026 16:33:39 -0500
+Subject: [PATCH] replay: keep the process uuid the same when a process is
+ re-run
+
+A process Replay's driver replays by re-running it has to do the same thing
+both times. The process uuid is random on macOS and goes into every track's
+descriptor, whose length then differed between a recording and its replay,
+and with it every address the heap gave out afterward (an Electron main
+process). The driver keeps the number.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ src/tracing/track.cc | 23 +++++++++++++++++++++++
+ 1 file changed, 23 insertions(+)
+
+diff --git a/src/tracing/track.cc b/src/tracing/track.cc
+index 009e8022..c0372ac0 100644
+--- a/src/tracing/track.cc
++++ b/src/tracing/track.cc
+@@ -14,6 +14,10 @@
+  * limitations under the License.
+  */
+ 
++#if defined(__APPLE__)
++#include <dlfcn.h>
++#endif
++
+ #include "perfetto/tracing/track.h"
+ 
+ #include "perfetto/ext/base/file_utils.h"
+@@ -219,6 +223,25 @@ void TrackRegistry::InitializeInstance(std::optional<uint64_t> process_uuid) {
+   } else {
+     Track::process_uuid = ComputeProcessUuid();
+   }
++
++#if defined(__APPLE__)
++  // [RecordReplay] A process Replay's driver replays by re-running it has to
++  // do the same thing both times, and this number is random: it goes into
++  // every track's descriptor, whose length then differed between a recording
++  // and its replay, and with it every address the heap gave out afterward (an
++  // Electron main process). The driver keeps the number.
++  {
++    auto* same = reinterpret_cast<bool (*)()>(
++        dlsym(RTLD_DEFAULT, "RecordReplayIsSameOnBothSides"));
++    auto* value = reinterpret_cast<uintptr_t (*)(const char*, uintptr_t)>(
++        dlsym(RTLD_DEFAULT, "RecordReplayValue"));
++    if (same && value && same()) {
++      Track::process_uuid = static_cast<uint64_t>(
++          value("perfetto::Track::process_uuid",
++                static_cast<uintptr_t>(Track::process_uuid)));
++    }
++  }
++#endif
+ }
+ 
+ // static
